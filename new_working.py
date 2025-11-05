@@ -80,15 +80,33 @@ def _build_tasks(self, documents: Dict[str, list], streamlit_off: bool = False):
     return tasks
 
 
-def get_all_file_names(self) -> Dict[str, str]:
-    all_files = {}
-    for store in [self.vector_store, self.summary_store]:
-        index = VectorStoreIndex.from_vector_store(store)
-        retriever = VectorIndexRetriever(index=index, similarity_top_k=1000)
-        for node in retriever.retrieve(""):
+def get_file_names(self) -> Dict[str, str]:
+    """Fetch unique file names currently stored in the Risklab VectorStore using retrievers."""
+    try:
+        self.logger.info("🔍 Fetching indexed file names from Risklab VectorStore...")
+
+        # Build retriever from the current Risklab VectorStore
+        vector_index = VectorStoreIndex.from_vector_store(self.vector_store)
+        retriever = VectorIndexRetriever(index=vector_index, similarity_top_k=1000)
+
+        # Perform a broad retrieval to list all stored documents
+        results = retriever.retrieve("")
+
+        if not results:
+            self.logger.info("📂 No indexed files found in Risklab VectorStore.")
+            return {}
+
+        file_names = {}
+        for node in results:
             meta = getattr(node, "metadata", {}) or {}
             fname = meta.get("file_name")
             fpath = meta.get("file_path")
             if fname and fpath:
-                all_files[fpath] = fname
-    return dict(sorted(all_files.items()))
+                file_names[fpath] = fname
+
+        self.logger.info(f"📚 Retrieved {len(file_names)} indexed files from Risklab store.")
+        return dict(sorted(file_names.items()))
+
+    except Exception as e:
+        self.logger.error(f"⚠️ Failed to fetch file names from Risklab store: {e}")
+        return {}

@@ -115,12 +115,12 @@ class IndexManager:
                     try:
                         self.summary_store.delete(ref_doc_id=h.node.id_)
                     except Exception as e:
-                        self.logger(f"Failed to delete summary node: {e}")
+                        self.logger.warbubg(f"Failed to delete summary node: {e}", streamlit_off=True)
 
                 if not v_hits and not s_hits:
-                    self.logger(f"No existing nodes found for '{doc_name_spaces}'.")
+                    self.logger.info(f"No existing nodes found for '{doc_name_spaces}'.", streamlit_off=True)
             except Exception as e:
-                self.logger(f"Unexpected deletion error: {e}")
+                self.logger.error(f"Unexpected deletion error: {e}", streamlit_off=True)
                 raise
 
     # 6️⃣

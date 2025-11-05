@@ -8,24 +8,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from llama_index.embeddings.azure_openai import AzureOpenAIEmbedding
 from llama_index.llms.azure_openai import AzureOpenAI
-from llama_index.core import Settings, Document, VectorStoreIndex
+from llama_index.core import Settings, VectorStoreIndex
 from llama_index.core.node_parser import SemanticSplitterNodeParser, SentenceSplitter
 from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, VectorStoreQuery
 from llama_index.readers import SimpleDirectoryReader
-from llama_index.core.schema import NodeWithScore
-from llama_index.core.schema import TextNode
+from llama_index.core.schema import Document as LlamaIndexDocument
 from risklab.vectorstore.llamaindex import RisklabVectorStore
 
-# -----------------------------------------------------------------------------
-# 1️⃣ Configure Models and Risklab
-# -----------------------------------------------------------------------------
+RISKLAB_OPEN_AI_KEY = os.getenv("RISKLAB_OPEN_AI_KEY")
 
 Settings.embed_model = AzureOpenAIEmbedding(
     engine="text-embedding-3-small",
     azure_ad_token_provider=get_bearer_token_provider(DefaultAzureCredential()),
     azure_endpoint="https://cognitiveservices.azure.com/.default",
 )
-
 Settings.llm = AzureOpenAI(
     engine="gpt-4o",
     azure_ad_token_provider=get_bearer_token_provider(DefaultAzureCredential()),
@@ -33,84 +30,107 @@ Settings.llm = AzureOpenAI(
 )
 
 
-# -----------------------------------------------------------------------------
-# 2️⃣ IndexManager
-# -----------------------------------------------------------------------------
-
 class IndexManager:
-    """Manages document ingestion, summarization, updates and deletion in RisklabVectorStore."""
-
     def __init__(self, use_streamlit: bool = True):
         self.logger = print
         self._deletion_lock = threading.Lock()
 
-        # --- Connect to Risklab remote stores ---
         self.vector_store = RisklabVectorStore(
-            api_key=os.getenv("RISKLAB_OPEN_AI_KEY"),
-            namespace="uga-ai",
-            collection_name="vector-store",
+            api_key=RISKLAB_OPEN_AI_KEY, namespace="uga-ai", collection_name="vector-store"
         )
         self.summary_store = RisklabVectorStore(
-            api_key=os.getenv("RISKLAB_OPEN_AI_KEY"),
-            namespace="uga-ai",
-            collection_name="summary-store",
+            api_key=RISKLAB_OPEN_AI_KEY, namespace="uga-ai", collection_name="summary-store"
         )
 
         self.vector_index = VectorStoreIndex.from_vector_store(self.vector_store)
         self.summary_index = VectorStoreIndex.from_vector_store(self.summary_store)
+        self._load_index_cache: Dict[str, Tuple[VectorStoreIndex, VectorStoreIndex]] = {}
 
-        self.logger("✅ Initialized IndexManager using RisklabVectorStore backend")
+    # 1️⃣
+    def _load_or_create_index(self, index_cache: Path, vector: bool = True):
+        return (VectorStoreIndex.from_vector_store(self.vector_store)
+                if vector else
+                VectorStoreIndex.from_vector_store(self.summary_store))
 
-    # -----------------------------------------------------------------------------
-    # 3️⃣ Knowledge Base Loaders (multi-format)
-    # -----------------------------------------------------------------------------
-
-    def _read_kb_docs(self, kb_dir: Path) -> List[Document]:
-        """Load all files in a knowledge base directory into LlamaIndex Document objects."""
+    # 2️⃣
+    def _read_kb_docs(self, kb_dir: Path) -> List[LlamaIndexDocument]:
         if not any(kb_dir.iterdir()):
-            self.logger("⚠️ No files found in knowledge base directory.")
+            self.logger("No files to index.")
             return []
-
-        self.logger(f"📂 Reading documents from {kb_dir}")
-        reader = SimpleDirectoryReader(
+        return SimpleDirectoryReader(
             input_dir=str(kb_dir),
             recursive=True,
             required_exts=[".pdf", ".pptx", ".docx", ".xlsx", ".txt", ".pkl"],
-        )
-        return reader.load_data()
+        ).load_data()
 
-    def _group_documents(self, kb_docs: List[Document]) -> Dict[str, List[Document]]:
-        """Group documents by file path."""
-        grouped: Dict[str, List[Document]] = {}
+    # 3️⃣
+    def _group_documents(self, kb_docs: List[LlamaIndexDocument]) -> Dict[str, List[LlamaIndexDocument]]:
+        out: Dict[str, List[LlamaIndexDocument]] = {}
         for doc in kb_docs:
-            file_path = doc.metadata.get("file_path", "unknown")
-            grouped.setdefault(file_path, []).append(doc)
-        return grouped
+            fp = doc.metadata.get("file_path", "unknown")
+            out.setdefault(fp, []).append(doc)
+        return out
 
-    # -----------------------------------------------------------------------------
-    # 4️⃣ Summary Generation
-    # -----------------------------------------------------------------------------
-
-    def _generate_document_summary(self, nodes: List[Document], doc_name: str) -> str:
-        """Use LLM to summarize a set of nodes."""
-        summary_prompt = (
-            f"Produce a concise and comprehensive summary for {doc_name}. "
-            f"Summarize main themes, findings, and key takeaways in ≤150 words:\n\n"
-            + "\n".join([n.text for n in nodes[:5]])
-        )
+    # 4️⃣
+    def _get_file_hash_from_store(self, doc_name: str) -> Optional[str]:
+        filters = MetadataFilters(filters=[MetadataFilter(key="file_path", value=doc_name)])
         try:
-            result = Settings.llm.complete(summary_prompt)
-            return str(result)
-        except Exception as e:
-            self.logger(f"⚠️ Failed to summarize {doc_name}: {e}")
-            return "No summary available."
+            result = self.vector_store.query(VectorStoreQuery(filters=filters, similarity_top_k=1))
+            if result and result.nodes:
+                return result.nodes[0].metadata.get("file_hash")
+        except Exception:
+            pass
+        return None
 
-    # -----------------------------------------------------------------------------
-    # 5️⃣ Prepare Nodes for Indexing
-    # -----------------------------------------------------------------------------
+    def _build_tasks(self, documents: Dict[str, List[LlamaIndexDocument]], streamlit_off: bool=False):
+        tasks = []
+        for doc_name, docs in documents.items():
+            incoming_hash = docs[0].metadata.get("file_hash")
+            existing_hash = self._get_file_hash_from_store(doc_name)
+            if not existing_hash:
+                tasks.append((doc_name, docs, "new", streamlit_off))
+            elif existing_hash != incoming_hash:
+                tasks.append((doc_name, docs, "overwrite", streamlit_off))
+            else:
+                self.logger(f"Skipping {doc_name}, unchanged.")
+        return tasks
 
-    def _prepare_nodes(self, docs: List[Document], doc_name: str) -> Tuple[List[TextNode], str]:
-        """Chunk and summarize a document, returning text nodes + summary."""
+    # 5️⃣
+    def _safe_delete_document_nodes(self, doc_name_spaces: str):
+        with self._deletion_lock:
+            try:
+                v_idx = VectorStoreIndex.from_vector_store(self.vector_store)
+                v_retr = VectorIndexRetriever(index=v_idx, similarity_top_k=100)
+                v_hits = v_retr.retrieve(doc_name_spaces)
+                for h in v_hits:
+                    try:
+                        self.vector_store.delete(ref_doc_id=h.node.id_)
+                    except Exception as e:
+                        self.logger(f"Failed to delete vector node: {e}")
+
+                s_idx = VectorStoreIndex.from_vector_store(self.summary_store)
+                s_retr = VectorIndexRetriever(index=s_idx, similarity_top_k=100)
+                s_hits = s_retr.retrieve(doc_name_spaces)
+                for h in s_hits:
+                    try:
+                        self.summary_store.delete(ref_doc_id=h.node.id_)
+                    except Exception as e:
+                        self.logger(f"Failed to delete summary node: {e}")
+
+                if not v_hits and not s_hits:
+                    self.logger(f"No existing nodes found for '{doc_name_spaces}'.")
+            except Exception as e:
+                self.logger(f"Unexpected deletion error: {e}")
+                raise
+
+    # 6️⃣
+    def _prepare_nodes(self, task: Tuple[str, List[LlamaIndexDocument], str, bool]):
+        doc_name, docs, action, streamlit_off = task
+        doc_name_spaces = doc_name.replace("_", " ")
+        if action == "overwrite":
+            self.logger(f"Re-indexing {doc_name_spaces}...")
+            self._safe_delete_document_nodes(doc_name_spaces)
+
         try:
             splitter = SemanticSplitterNodeParser(buffer_size=3, breakpoint_percentile_threshold=85)
             nodes = splitter.get_nodes_from_documents(docs)
@@ -118,124 +138,106 @@ class IndexManager:
             splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
             nodes = splitter.get_nodes_from_documents(docs)
 
-        summary = self._generate_document_summary(nodes, doc_name)
+        summary = self._generate_document_summary(nodes, doc_name_spaces)
         for node in nodes:
-            node.metadata["file_name"] = os.path.basename(doc_name)
-            node.metadata["file_path"] = doc_name
-            node.metadata["document_summary"] = summary
-        return nodes, summary
+            node.metadata.update({
+                "document_summary": summary,
+                "file_name": os.path.basename(doc_name),
+                "file_path": doc_name,
+            })
 
-    # -----------------------------------------------------------------------------
-    # 6️⃣ Core Index Operations
-    # -----------------------------------------------------------------------------
-
-    def index_documents(self, kb_dir: Path, parallel: bool = True, max_workers: int = 4):
-        """Index all documents in a directory into Risklab stores."""
-        kb_docs = self._read_kb_docs(kb_dir)
-        grouped_docs = self._group_documents(kb_docs)
-        if not grouped_docs:
-            self.logger("⚠️ No documents found to index.")
-            return
-
-        tasks = list(grouped_docs.items())
-        if parallel:
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = {ex.submit(self._index_single, name, docs): name for name, docs in tasks}
-                for f in as_completed(futures):
-                    name = futures[f]
-                    try:
-                        f.result()
-                        self.logger(f"✅ Indexed {name}")
-                    except Exception as e:
-                        self.logger(f"❌ Failed indexing {name}: {e}")
-        else:
-            for name, docs in tasks:
-                self._index_single(name, docs)
-
-    def _index_single(self, doc_name: str, docs: List[Document]):
-        """Index one document (vector + summary embeddings)."""
-        self.logger(f"📄 Indexing {doc_name}")
-        nodes, summary = self._prepare_nodes(docs, doc_name)
-
-        # Main embeddings
         embedded_nodes = Settings.embed_model(nodes)
         self.vector_store.add(embedded_nodes)
-        self.logger(f"✅ Added {len(embedded_nodes)} nodes to vector store")
 
-        # Summary embeddings
-        summary_doc = Document(text=summary, metadata={"file_name": os.path.basename(doc_name)})
-        summary_nodes = [summary_doc]
-        embedded_summary = Settings.embed_model(summary_nodes)
+        summary_doc = LlamaIndexDocument(text=summary, metadata={"file_name": os.path.basename(doc_name), "file_path": doc_name})
+        embedded_summary = Settings.embed_model([summary_doc])
         self.summary_store.add(embedded_summary)
-        self.logger(f"✅ Added summary for {doc_name}")
 
-    def update_document(self, file_path: str):
-        """Re-index an existing document by deleting and re-adding."""
-        file_name = os.path.basename(file_path)
-        self.delete_document(file_name)
-        kb_docs = self._read_kb_docs(Path(file_path).parent)
-        docs = [d for d in kb_docs if d.metadata.get("file_name") == file_name]
-        if docs:
-            self._index_single(file_name, docs)
+        return (doc_name, nodes, action, streamlit_off)
+
+    # 7️⃣
+    def persist_indices(self):
+        self.logger("Indices persisted remotely to RisklabVectorStore (no local cache).")
+
+    # 8️⃣
+    def _generate_document_summary(self, nodes: List, doc_name: str) -> str:
+        summary_prompt = (
+            "Produce a concise and comprehensive summary description. "
+            "Start with 10–25 words describing the document type and purpose. "
+            "Aim for 50–150 words total."
+        )
+        try:
+            from llama_index.core import SummaryIndex
+            query_engine = SummaryIndex(nodes).as_query_engine()
+            return str(query_engine.query(summary_prompt))
+        except Exception:
+            try:
+                return str(Settings.llm.complete(summary_prompt + "\n\n" + "\n".join(n.text for n in nodes[:5])))
+            except Exception:
+                return "No summary."
+
+    # 9️⃣
+    def update_index(self, kb_dir: Path, parallel: bool=True, max_workers: Optional[int]=None, streamlit_off: bool=False):
+        kb_docs = self._read_kb_docs(kb_dir)
+        if not kb_docs:
+            self.logger("Nothing to index.")
+            return
+        documents = self._group_documents(kb_docs)
+        tasks = self._build_tasks(documents, streamlit_off=streamlit_off)
+
+        if parallel and tasks:
+            max_workers = max_workers or min(8, os.cpu_count() or 4)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(self._prepare_nodes, t) for t in tasks]
+                for f in as_completed(futures):
+                    _ = f.result()
         else:
-            self.logger(f"⚠️ File {file_name} not found for update.")
+            for t in tasks:
+                self._prepare_nodes(t)
+        self.logger(f"Indexed {len(tasks)} documents successfully.")
 
-    def delete_document(self, file_name: str):
-        """Delete embeddings from both stores for a given file."""
-        self.logger(f"🗑️ Deleting '{file_name}'")
-        with self._deletion_lock:
-            vector_index = VectorStoreIndex.from_vector_store(self.vector_store)
-            summary_index = VectorStoreIndex.from_vector_store(self.summary_store)
-            vec_retr = VectorIndexRetriever(index=vector_index, similarity_top_k=50)
-            sum_retr = VectorIndexRetriever(index=summary_index, similarity_top_k=50)
-            vec_matches = vec_retr.retrieve(file_name)
-            sum_matches = sum_retr.retrieve(file_name)
+    # 🔟
+    def load_index(self, files_sel: List[str] = []) -> Dict[str, Tuple[VectorStoreIndex, VectorStoreIndex]]:
+        selection = set(files_sel) if files_sel else None
+        index: Dict[str, Tuple[VectorStoreIndex, VectorStoreIndex]] = {}
+        doc_names = selection or {"*"}
+        for doc_name in doc_names:
+            if doc_name in self._load_index_cache:
+                index[doc_name] = self._load_index_cache[doc_name]
+                continue
+            v_idx = VectorStoreIndex.from_vector_store(self.vector_store)
+            s_idx = VectorStoreIndex.from_vector_store(self.summary_store)
+            pair = (v_idx, s_idx)
+            self._load_index_cache[doc_name] = pair
+            index[doc_name] = pair
+        self.logger("Index loaded successfully.")
+        return index
 
-            for m in vec_matches:
-                try:
-                    self.vector_store.delete(ref_doc_id=m.node.id_)
-                except Exception as e:
-                    self.logger(f"⚠️ Could not delete vector node: {e}")
+    # 11️⃣
+    def get_file_names(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        try:
+            client = getattr(self.vector_store, "client", None)
+            client = client() if callable(client) else client
+            if client and hasattr(client, "list_nodes"):
+                for n in client.list_nodes():
+                    fp = (n.metadata or {}).get("file_path")
+                    fh = (n.metadata or {}).get("file_hash")
+                    if fp:
+                        if fp not in mapping or (fh and not mapping.get(fp)):
+                            mapping[fp] = fh
+        except Exception:
+            pass
+        return mapping
 
-            for m in sum_matches:
-                try:
-                    self.summary_store.delete(ref_doc_id=m.node.id_)
-                except Exception as e:
-                    self.logger(f"⚠️ Could not delete summary node: {e}")
-
-            self.logger(f"✅ Deleted {len(vec_matches)} vectors and {len(sum_matches)} summaries")
-
-    # -----------------------------------------------------------------------------
-    # 7️⃣ Query
-    # -----------------------------------------------------------------------------
-
-    def query(self, text: str, top_k: int = 3):
-        """Query vector and summary indices."""
-        v_idx = VectorStoreIndex.from_vector_store(self.vector_store)
-        s_idx = VectorStoreIndex.from_vector_store(self.summary_store)
-
-        v_retr = VectorIndexRetriever(index=v_idx, similarity_top_k=top_k)
-        s_retr = VectorIndexRetriever(index=s_idx, similarity_top_k=2)
-
-        v_results = v_retr.retrieve(text)
-        s_results = s_retr.retrieve(text)
-
-        self.logger("🔍 Vector Results:")
-        for r in v_results:
-            self.logger(f"• {r.metadata.get('file_name')} | score={r.score:.3f}")
-        self.logger("🧾 Summary Results:")
-        for r in s_results:
-            self.logger(f"• {r.metadata.get('file_name')} | score={r.score:.3f}")
-        return v_results, s_results
-
-
-# -----------------------------------------------------------------------------
-# 8️⃣ Example Run
-# -----------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    kb_path = Path("/mnt/data/knowledge_base")
-    manager = IndexManager()
-    manager.index_documents(kb_path)
-    manager.query("What does the document say about MLOps governance?")
+    # 12️⃣
+    def get_document_summary(self, doc_name: str) -> Optional[str]:
+        try:
+            s_idx = VectorStoreIndex.from_vector_store(self.summary_store)
+            s_retr = VectorIndexRetriever(index=s_idx, similarity_top_k=5)
+            hits = s_retr.retrieve(doc_name)
+            for h in hits:
+                return h.metadata.get("document_summary") or h.text
+        except Exception:
+            pass
 

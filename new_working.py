@@ -27,57 +27,50 @@ def _get_file_hash_from_store(self, doc_name: str) -> Optional[str]:
         return None
 
 
-def _build_tasks(self, documents: Dict[str, list], streamlit_off: bool = False):
+def _build_tasks(self, documents: Dict[str, List[LlamaIndexDocument]], streamlit_off: bool = False):
     """
-    Compare local documents with Risklab VectorStore and prepare a list of indexing tasks.
-
-    Returns:
-        list[tuple]: [(doc_name, nodes, err)] for processing by update_index().
+    Compare local document metadata with Risklab VectorStore hashes and prepare indexing tasks.
+    Uses metadata-based file_hash and caches Risklab lookups to avoid repeated queries.
     """
     tasks = []
-    self._cached_hashes = {}  # simple session cache to reduce repeated retriever calls
+    self._cached_hashes = getattr(self, "_cached_hashes", {})  # persistent across updates
 
     try:
-        # Step 1: Get all stored file names from Risklab store
-        stored_files = self.get_file_names()
-        if not stored_files:
-            self.logger.info("🆕 No files currently indexed — all local files will be added.")
-
-        # Step 2: Iterate through local documents to compare hashes and prepare indexing tasks
-        for doc_name, doc_nodes in documents.items():
+        for doc_name, docs in documents.items():
             try:
-                # Compute current file hash
-                file_hash = self._compute_file_hash(doc_name)
-                if not file_hash:
-                    raise ValueError("File hash could not be computed.")
-
-                # Check Risklab store for existing hash
-                existing_hash = self._cached_hashes.get(doc_name)
-                if not existing_hash:
-                    existing_hash = self._get_file_hash_from_store(doc_name)
-                    if existing_hash:
-                        self._cached_hashes[doc_name] = existing_hash
-
-                # Step 3: Determine if update is needed
-                if existing_hash == file_hash:
-                    self.logger.info(f"⏩ Skipping {doc_name} (hash unchanged).")
+                # Get hash from document metadata (already computed in prepare_nodes)
+                incoming_hash = docs[0].metadata.get("file_hash")
+                if not incoming_hash:
+                    self.logger.warning(f"⚠️ No file_hash in metadata for {doc_name}, skipping.")
                     continue
 
-                # Step 4: Prepare task for reindexing
-                self.logger.info(f"📄 Queued {doc_name} for indexing (new or updated).")
-                tasks.append((doc_name, doc_nodes, None))
+                # Retrieve existing hash, with in-memory caching to avoid repeated retriever calls
+                existing_hash = self._cached_hashes.get(doc_name)
+                if existing_hash is None:
+                    existing_hash = self._get_file_hash_from_store(doc_name)
+                    self._cached_hashes[doc_name] = existing_hash  # even if None, cache it
+
+                # Compare hashes to decide what to do
+                if not existing_hash:
+                    self.logger.info(f"🆕 {doc_name}: New file detected — indexing.", streamlit_off=streamlit_off)
+                    tasks.append((doc_name, docs, "new", streamlit_off))
+                elif existing_hash != incoming_hash:
+                    self.logger.info(f"🔄 {doc_name}: File changed — overwriting.", streamlit_off=streamlit_off)
+                    tasks.append((doc_name, docs, "overwrite", streamlit_off))
+                else:
+                    self.logger.info(f"⏩ {doc_name}: Unchanged, skipping.", streamlit_off=streamlit_off)
 
             except Exception as e:
-                self.logger.warning(f"⚠️ Skipping {doc_name} due to error: {e}")
+                self.logger.warning(f"⚠️ Error processing {doc_name}: {e}")
                 tasks.append((doc_name, None, str(e)))
+
+        self.logger.info(f"🧾 Prepared {len(tasks)} document(s) for indexing.")
+        return tasks
 
     except Exception as e:
         self.logger.error(f"💥 Failed to build tasks for update_index: {e}")
-        tasks.append(("__global__", None, str(e)))
+        return []
 
-    # Step 5: Log summary
-    self.logger.info(f"🧾 Prepared {len(tasks)} documents for indexing.")
-    return tasks
 
 
 def get_file_names(self) -> Dict[str, str]:

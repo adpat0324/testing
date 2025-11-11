@@ -1,158 +1,91 @@
-# file_tree.py
-from typing import Dict, List, Set, Optional
 import streamlit as st
-
-from typing import Dict, List, Set, Optional
-import streamlit as st
-
-# ============================================================
-#  Original Classes (kept for compatibility)
-# ============================================================
-
-class FileNode:
-    """Represents a node in the file tree (folder or file)."""
-    def __init__(self, name: str, is_file: bool = False, file_path: Optional[str] = None):
-        self.name = name
-        self.is_file = is_file
-        self.file_path = file_path
-        self.children: Dict[str, 'FileNode'] = {}
-
-    def add_child(self, name: str, is_file: bool = False, file_path: Optional[str] = None) -> 'FileNode':
-        if name not in self.children:
-            self.children[name] = FileNode(name, is_file, file_path)
-        return self.children[name]
-
-
-class FileTreeBuilder:
-    """Build a hierarchical tree structure from file metadata."""
-
-    @staticmethod
-    def build_tree(file_metadata: Dict[str, Dict]) -> Dict[str, FileNode]:
-        roots = {}
-
-        for file_path, metadata in file_metadata.items():
-            site_name = metadata.get("sitePath")
-            drive_name = metadata.get("driveName")
-            parent_path = metadata.get("parentPath")
-
-            # Determine the root name
-            if site_name and drive_name:
-                root_name = f"{site_name}/{drive_name}"
-            elif site_name:
-                root_name = site_name
-            else:
-                root_name = "Other Files"
-
-            # Create root node if needed
-            if root_name not in roots:
-                roots[root_name] = FileNode(root_name)
-
-            current = roots[root_name]
-
-            # Build folder structure
-            if parent_path:
-                for part in parent_path.strip("/").split("/"):
-                    current = current.add_child(part)
-
-            # Add file
-            current.add_child(file_path, is_file=True, file_path=file_path)
-
-        return roots
-
-
-# ============================================================
-#  New Flat File Selector (Searchable, Scrollable)
-# ============================================================
+from typing import Dict, List, Optional
 
 class FileTreeSelector:
-    """
-    Flat searchable file selector with Select All.
-    Does not use the tree for UI, but original classes remain for compatibility.
-    """
+    """Flat searchable file selector with a working Select All toggle."""
 
-    def __init__(self, file_metadata: Dict[str, Dict]):
+    def __init__(self, file_metadata: Dict[str, Dict], state_key: str = "fts"):
         self.file_metadata = file_metadata or {}
+        self.state_key = state_key
 
-        # Build flat option list (paths)
-        self.options: List[str] = sorted(self.file_metadata.keys(), key=lambda x: x.lower())
+        # All file paths
+        self.options = sorted(self.file_metadata.keys(), key=str.lower)
 
-        # Session keys (persistent but safe)
-        self._search_key = "fts_search"
-        self._all_key = "fts_select_all"
-        self._ms_key = "fts_multiselect"
+        # Widget keys (allowed to modify inside callbacks)
+        self.k_search = f"{state_key}_search"
+        self.k_selectall = f"{state_key}_all"
+        self.k_multiselect = f"{state_key}_ms"
 
-        if self._search_key not in st.session_state:
-            st.session_state[self._search_key] = ""
+        # Initialize widget state once
+        st.session_state.setdefault(self.k_search, "")
+        st.session_state.setdefault(self.k_selectall, False)
+        st.session_state.setdefault(self.k_multiselect, [])
 
-        if self._all_key not in st.session_state:
-            st.session_state[self._all_key] = False
+    # ----------------------------
+    # CALLBACKS
+    # ----------------------------
 
-        if self._ms_key not in st.session_state:
-            st.session_state[self._ms_key] = []
+    def _toggle_select_all(self):
+        """When Select All checkbox toggles, update the multiselect widget directly."""
+        if st.session_state[self.k_selectall]:
+            # Select ALL visible filtered items
+            search = st.session_state[self.k_search].lower()
+            filtered = [
+                p for p in self.options
+                if search in p.lower()
+            ]
+            st.session_state[self.k_multiselect] = filtered
+        else:
+            # Clear all selected
+            st.session_state[self.k_multiselect] = []
 
-    # ---------------------------------------------------------
+    def _sync_selectall_to_multiselect(self, filtered_list: List[str]):
+        """Automatically keeps Select All synced to multiselect content."""
+        selected = st.session_state[self.k_multiselect]
+        st.session_state[self.k_selectall] = (
+            len(filtered_list) > 0 and set(selected) == set(filtered_list)
+        )
+
+    # ----------------------------
+    # RENDER
+    # ----------------------------
+
     def render(self, container: Optional[st.delta_generator.DeltaGenerator] = None,
-               height: int = 350) -> List[str]:
+               height: int = 300) -> List[str]:
 
         if container is None:
             container = st
 
-        # Search box
-        search_val = container.text_input(
-            "Search documents",
-            key=self._search_key,
-            placeholder="Search…"
+        # SEARCH BAR
+        search = container.text_input(
+            "Search Documents",
+            key=self.k_search,
+            placeholder="Type to filter files…",
         ).lower()
 
-        filtered = [p for p in self.options if search_val in p.lower()]
+        # FILTERED OPTIONS
+        filtered = [
+            p for p in self.options
+            if search in p.lower()
+        ]
 
-        # Select All toggle
-        def toggle_all():
-            if st.session_state[self._all_key]:
-                st.session_state[self._ms_key] = filtered.copy()
-            else:
-                st.session_state[self._ms_key] = []
-
+        # SELECT ALL
         container.checkbox(
-            "Select All",
-            key=self._all_key,
-            on_change=toggle_all,
+            "Select All (filtered)",
+            key=self.k_selectall,
+            on_change=self._toggle_select_all
         )
 
-        # Scrollable multiselect using CSS
-        container.markdown(
-            f"""
-            <style>
-            .fts-scroll-box {{
-                max-height: {height}px;
-                overflow-y: auto;
-                border: 1px solid #CCC;
-                border-radius: 6px;
-                padding: 6px;
-            }}
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-
-        container.markdown('<div class="fts-scroll-box">', unsafe_allow_html=True)
-
+        # MULTISELECT LIST (searchable & scrollable automatically)
         selected = container.multiselect(
             "",
             options=filtered,
-            default=st.session_state[self._ms_key],
-            key=self._ms_key,
+            key=self.k_multiselect,
         )
 
-        container.markdown("</div>", unsafe_allow_html=True)
+        # KEEP SELECT ALL IN SYNC
+        self._sync_selectall_to_multiselect(filtered)
 
-        # Sync back
-        st.session_state[self._ms_key] = selected
-        st.session_state[self._all_key] = (
-            len(filtered) > 0 and len(selected) == len(filtered)
-        )
-
-        # Footer
         container.caption(f"**{len(selected)} files selected**")
 
         return selected

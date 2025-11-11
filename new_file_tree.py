@@ -211,3 +211,126 @@ class FileTreeSelector:
 
 
 
+
+
+
+
+
+
+
+
+
+from typing import Dict, List
+import streamlit as st
+
+
+class FileTreeSelector:
+    """
+    Flat searchable file selector with Select All.
+    Compatible with your existing API:
+        selector = FileTreeSelector(file_metadata)
+        selected = selector.render(container)
+    """
+
+    def __init__(self, file_metadata: Dict[str, Dict]):
+        self.file_metadata = file_metadata or {}
+        self.options = sorted(self.file_metadata.keys(), key=lambda x: x.lower())
+        self.selected = set()
+
+        # Session keys
+        self._search_key = "fts_search"
+        self._all_key = "fts_select_all"
+        self._ms_key = "fts_multiselect"
+
+        # Initialize state only once
+        if self._all_key not in st.session_state:
+            st.session_state[self._all_key] = False
+
+        if self._ms_key not in st.session_state:
+            st.session_state[self._ms_key] = []
+
+        if self._search_key not in st.session_state:
+            st.session_state[self._search_key] = ""
+
+    # -----------------------------------------------------
+    # Render
+    # -----------------------------------------------------
+    def render(self, container=None, height: int = 350) -> List[str]:
+        """
+        Render the widget inside the provided container.
+
+        Returns:
+            List[str]: selected file paths
+        """
+        if container is None:
+            container = st
+
+        # Search bar
+        search_query = container.text_input(
+            "Search documents",
+            key=self._search_key,
+            placeholder="Search…",
+        ).lower().strip()
+
+        # Filtered options
+        filtered = [
+            path for path in self.options
+            if search_query in path.lower()
+        ]
+
+        # Select All
+        def toggle_all():
+            if st.session_state[self._all_key]:
+                st.session_state[self._ms_key] = filtered.copy()
+            else:
+                st.session_state[self._ms_key] = []
+
+        container.checkbox(
+            "Select All",
+            key=self._all_key,
+            on_change=toggle_all,
+        )
+
+        # Scrollable list container using HTML/CSS
+        container.markdown(
+            f"""
+            <style>
+            .scrollable-multiselect {{
+                max-height: {height}px;
+                overflow-y: auto;
+                padding: 0.25rem;
+                border: 1px solid #CCC;
+                border-radius: 0.25rem;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with container.container():
+            # Use custom scroll area
+            with container.container():
+                container.markdown('<div class="scrollable-multiselect">', unsafe_allow_html=True)
+
+                selected = container.multiselect(
+                    "",
+                    options=filtered,
+                    default=st.session_state[self._ms_key],
+                    key=self._ms_key,
+                )
+
+                container.markdown("</div>", unsafe_allow_html=True)
+
+        # Sync selections
+        st.session_state[self._ms_key] = selected
+        self.selected = set(selected)
+
+        # Auto-update Select All state
+        st.session_state[self._all_key] = (len(filtered) > 0 and len(selected) == len(filtered))
+
+        container.caption(f"**{len(selected)} files selected**")
+
+        return selected
+
+
+

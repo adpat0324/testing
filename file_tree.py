@@ -1,3 +1,122 @@
+class FileTreeSelector:
+    """
+    Flat, searchable, scrollable file selector with a real Select All toggle.
+    Updated to avoid modifying Streamlit widget keys after creation.
+    """
+
+    def __init__(self, file_metadata: Dict[str, Dict], *, state_key: str = "fts"):
+        self.file_metadata = file_metadata or {}
+        self.state_key = state_key
+
+        # Build stable option list
+        self.options: List[str] = sorted(
+            self.file_metadata.keys(),
+            key=lambda p: (self.file_metadata.get(p, {}).get("file_name") or p).lower()
+        )
+
+        # Labels for display
+        self.labels = {
+            p: self.file_metadata.get(p, {}).get("file_name") or p
+            for p in self.options
+        }
+
+        # Session keys — note: _all_key is ONLY controlled by checkbox callback
+        self._sel_key = f"{self.state_key}_selected"        # list of selected paths
+        self._all_key = f"{self.state_key}_select_all"      # widget checkbox
+        self._ms_key  = f"{self.state_key}_multiselect"     # widget list
+
+        # We use a derived state, NOT the widget key, for internal sync logic
+        self._computed_all = f"{self.state_key}_computed_all"
+
+        # Initialize session state safely
+        ss = st.session_state
+        ss.setdefault(self._sel_key, [])
+        ss.setdefault(self._all_key, False)      # widget controls this
+        ss.setdefault(self._ms_key, [])
+        ss.setdefault(self._computed_all, False)
+
+    # ----------------------------------------------------------------------
+    # ❗ No longer touches st.session_state[self._all_key] directly
+    # Only computes whether all should be checked
+    # ----------------------------------------------------------------------
+    def _compute_select_all(self):
+        ss = st.session_state
+        all_selected = (
+            len(ss[self._sel_key]) == len(self.options) and len(self.options) > 0
+        )
+        ss[self._computed_all] = all_selected  # safe, not a widget key
+
+    # ----------------------------------------------------------------------
+    # ✅ Only legal place to modify st.session_state[self._all_key] or selection
+    # ----------------------------------------------------------------------
+    def _on_select_all_toggle(self):
+        ss = st.session_state
+        if ss[self._all_key]:  # user checked "Select All"
+            ss[self._sel_key] = list(self.options)
+            ss[self._ms_key]  = list(self.options)
+        else:                  # user unchecked it
+            ss[self._sel_key] = []
+            ss[self._ms_key]  = []
+
+    # ----------------------------------------------------------------------
+    def render(self, container=None) -> List[str]:
+        if container is None:
+            container = st
+
+        ss = st.session_state
+
+        # Before rendering widgets, compute whether all should be selected.
+        # This does NOT touch the widget key.
+        self._compute_select_all()
+
+        # ------------------------------------------------------
+        # ✅ SELECT ALL CHECKBOX (widget key must NOT be overwritten later)
+        # ------------------------------------------------------
+        container.checkbox(
+            "Select All",
+            key=self._all_key,
+            value=ss[self._all_key],  # widget owns this
+            on_change=self._on_select_all_toggle,
+            help="Toggle to select/unselect all files."
+        )
+
+        # ------------------------------------------------------
+        # ✅ MULTISELECT (searchable + scrollable)
+        # ------------------------------------------------------
+        container.markdown("""
+            <style>
+            div[data-baseweb="select"] > div { max-height: 380px; overflow-y: auto; }
+            </style>
+        """, unsafe_allow_html=True)
+
+        selected = container.multiselect(
+            "Pick Documents",
+            options=self.options,
+            default=ss[self._sel_key],
+            key=self._ms_key,
+            format_func=lambda p: self.labels.get(p, p),
+            placeholder="Search files…"
+        )
+
+        # Update selected state only (legal)
+        ss[self._sel_key] = selected
+
+        # Recompute "computed all" (indirect state)
+        self._compute_select_all()
+
+        # Now update the widget state if it is OUT OF SYNC
+        # Must be done BEFORE the next render cycle triggers the widget
+        if ss[self._all_key] != ss[self._computed_all]:
+            ss[self._all_key] = ss[self._computed_all]
+
+        # Footer count
+        container.caption(f"**{len(selected)} files selected**")
+
+        return selected
+
+
+
+
 class FileTreeBuilder:
     """Builds a flat file list from metadata (no hierarchy)."""
 

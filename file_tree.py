@@ -100,3 +100,113 @@ class FileTreeSelector:
         return list(self.selected_files)
 
 
+
+
+
+
+# app/config/file_tree.py
+
+from typing import Dict, List, Optional
+import streamlit as st
+
+class FileTreeSelector:
+    """
+    Flat, searchable, scrollable file selector with a true Select All toggle.
+    API-compatible with your previous selector:
+      selected = FileTreeSelector(file_metadata).render(container) -> List[str]
+    """
+
+    def __init__(self, file_metadata: Dict[str, Dict], *, state_key: str = "fts"):
+        self.file_metadata = file_metadata or {}
+        self.state_key = state_key
+
+        # Build stable option list + labels
+        # options are file_paths; labels display file names (fallback to path)
+        self.options: List[str] = sorted(
+            self.file_metadata.keys(),
+            key=lambda p: (self.file_metadata.get(p, {}).get("file_name") or p).lower()
+        )
+        self.labels = {
+            p: self.file_metadata.get(p, {}).get("file_name") or p for p in self.options
+        }
+
+        # Session keys
+        self._sel_key = f"{self.state_key}_selected"
+        self._all_key = f"{self.state_key}_select_all"
+        self._ms_key  = f"{self.state_key}_multiselect"
+
+        # Init session state defaults once
+        if self._sel_key not in st.session_state:
+            st.session_state[self._sel_key] = []
+        if self._all_key not in st.session_state:
+            st.session_state[self._all_key] = False
+        if self._ms_key not in st.session_state:
+            st.session_state[self._ms_key] = []
+
+    def _sync_select_all_checkbox(self):
+        """Keep the 'Select All' checkbox in sync with current selection size."""
+        all_selected = len(st.session_state[self._sel_key]) == len(self.options) and len(self.options) > 0
+        st.session_state[self._all_key] = all_selected
+
+    def _on_select_all_toggle(self):
+        """Callback when 'Select All' is toggled: set selection accordingly."""
+        if st.session_state[self._all_key]:
+            st.session_state[self._sel_key] = list(self.options)
+            st.session_state[self._ms_key]  = list(self.options)
+        else:
+            st.session_state[self._sel_key] = []
+            st.session_state[self._ms_key]  = []
+
+    def render(self, container: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
+        """
+        Render the selector and return the list of selected file paths.
+        """
+        if container is None:
+            container = st
+
+        # --- Controls header
+        with container.container():
+            # A slim header row with Select All (kept in sync)
+            self._sync_select_all_checkbox()
+            container.checkbox(
+                "Select All",
+                key=self._all_key,
+                value=st.session_state[self._all_key],
+                on_change=self._on_select_all_toggle,
+                help="Toggle to select/unselect all files in the list."
+            )
+
+        # --- Searchable, scrollable multi-select
+        # st.multiselect is searchable and scrollable by default.
+        # We keep it in a container with a fixed max height via simple CSS.
+        with container.container():
+            # Optional: cap height of the widget’s area
+            container.markdown(
+                """
+                <style>
+                div[data-baseweb="select"] > div { max-height: 380px; overflow-y: auto; }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            selected = container.multiselect(
+                "Pick Documents",
+                options=self.options,
+                default=st.session_state[self._sel_key],
+                key=self._ms_key,
+                format_func=lambda p: self.labels.get(p, p),
+                placeholder="Search files…"
+            )
+
+        # Persist & sync state
+        st.session_state[self._sel_key] = selected
+        self._sync_select_all_checkbox()
+
+        # Footer count
+        container.caption(f"**{len(selected)}** files selected")
+
+        return selected
+
+
+

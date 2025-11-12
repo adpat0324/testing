@@ -1,107 +1,170 @@
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import streamlit as st
 
 
+class FileNode:
+    """Represents a node in the file tree (folder or file)."""
+    def __init__(self, name: str, is_file: bool = False, file_path: Optional[str] = None):
+        self.name = name
+        self.is_file = is_file
+        self.file_path = file_path
+        self.children: Dict[str, "FileNode"] = {}
+
+    def add_child(self, name: str, is_file: bool = False, file_path: Optional[str] = None) -> "FileNode":
+        """Add or get a child node."""
+        if name not in self.children:
+            self.children[name] = FileNode(name, is_file, file_path)
+        return self.children[name]
+
+
 class FileTreeSelector:
-    """
-    Flat, searchable, scrollable file selector with a working Select All checkbox.
-    Compatible with previous API:
-      selected = FileTreeSelector(file_metadata).render(container)
-    """
+    """Interactive hierarchical file tree selector with search, scroll, and working select-all."""
 
     def __init__(self, file_metadata: Dict[str, Dict]):
         self.file_metadata = file_metadata or {}
+        self.tree: Dict[str, FileNode] = self._build_tree(file_metadata)
+        self.selected_files: Set[str] = set()
 
-        # Build file list and labels
-        self.file_paths: List[str] = sorted(self.file_metadata.keys())
-        self.labels = {
-            p: self.file_metadata.get(p, {}).get("file_name") or p for p in self.file_paths
-        }
+    # --------------------------------------------------------------------------
+    # Build a hierarchical tree from file metadata
+    def _build_tree(self, file_metadata: Dict[str, Dict]) -> Dict[str, FileNode]:
+        roots: Dict[str, FileNode] = {}
 
-        # Streamlit state keys
-        self.key_prefix = "fts"
-        self.selected_key = f"{self.key_prefix}_selected"
-        self.select_all_key = f"{self.key_prefix}_select_all"
+        for file_path, metadata in file_metadata.items():
+            # Split by slashes to form hierarchy
+            parts = [p for p in file_path.strip("/").split("/") if p]
+            if not parts:
+                continue
 
-        # Initialize state
-        if self.selected_key not in st.session_state:
-            st.session_state[self.selected_key] = []
-        if self.select_all_key not in st.session_state:
-            st.session_state[self.select_all_key] = False
+            root_name = parts[0]
+            if root_name not in roots:
+                roots[root_name] = FileNode(root_name)
 
+            current = roots[root_name]
+            for part in parts[1:-1]:
+                current = current.add_child(part)
+            current.add_child(parts[-1], is_file=True, file_path=file_path)
+
+        return roots
+
+    # --------------------------------------------------------------------------
+    # Recursive search
+    def _filter_tree(self, node: FileNode, query: str) -> Optional[FileNode]:
+        """Return filtered copy of node that matches query or has matching descendants."""
+        if not query:
+            return node
+
+        clean_query = query.lower()
+        match_self = clean_query in node.name.lower()
+
+        filtered_children = {}
+        for child_name, child in node.children.items():
+            filtered_child = self._filter_tree(child, query)
+            if filtered_child:
+                filtered_children[child_name] = filtered_child
+
+        if match_self or filtered_children:
+            new_node = FileNode(node.name, node.is_file, node.file_path)
+            new_node.children = filtered_children
+            return new_node
+
+        return None
+
+    def _get_all_files(self, node: FileNode) -> Set[str]:
+        """Recursively collect all file paths under a node."""
+        files = set()
+        if node.is_file and node.file_path:
+            files.add(node.file_path)
+        for child in node.children.values():
+            files.update(self._get_all_files(child))
+        return files
+
+    # --------------------------------------------------------------------------
+    # Recursive renderer
+    def _render_node(self, node: FileNode, level: int = 0, parent_selected: bool = False):
+        """Render each folder/file recursively with checkboxes."""
+        indent = " " * level  # Unicode em space for hierarchy indentation
+
+        if node.is_file:
+            checked = node.file_path in self.selected_files or parent_selected
+            if st.checkbox(f"{indent}📄 {node.name}", value=checked, key=node.file_path):
+                self.selected_files.add(node.file_path)
+            else:
+                self.selected_files.discard(node.file_path)
+        else:
+            # Folder expander with “Select all in folder”
+            with st.expander(f"{indent}📁 {node.name}", expanded=False):
+                folder_files = self._get_all_files(node)
+                folder_selected = all(f in self.selected_files for f in folder_files)
+
+                # Use callback-safe checkbox
+                def toggle_folder():
+                    if st.session_state[f"{node.name}_select_all"]:
+                        self.selected_files.update(folder_files)
+                    else:
+                        self.selected_files.difference_update(folder_files)
+
+                st.checkbox(
+                    "Select all in folder",
+                    key=f"{node.name}_select_all",
+                    value=folder_selected,
+                    on_change=toggle_folder,
+                )
+
+                for child in sorted(node.children.values(), key=lambda n: n.name.lower()):
+                    self._render_node(child, level + 1, parent_selected=folder_selected)
+
+    # --------------------------------------------------------------------------
     def render(self, container: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
-        """
-        Render searchable, scrollable file selector with Select All.
-        """
+        """Main renderer entry point."""
         if container is None:
             container = st
 
-        # --- Search bar ---
-        search_query = container.text_input("🔍 Search files", "").strip().lower()
+        # Search input
+        search_query = container.text_input("🔍 Search files and folders", "").strip()
 
-        # Filter matching files (recursively match full path and metadata)
-        if search_query:
-            filtered_files = [
-                p for p in self.file_paths
-                if search_query in p.lower() or search_query in self.labels[p].lower()
-            ]
-        else:
-            filtered_files = self.file_paths
+        # Scrollable container
+        with container.container():
+            container.markdown(
+                """
+                <style>
+                div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"] {
+                    max-height: 450px;
+                    overflow-y: auto;
+                    padding-right: 0.5rem;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        # --- Select All ---
-        # Compute whether all visible files are selected
-        all_visible_selected = (
-            len(filtered_files) > 0
-            and all(p in st.session_state[self.selected_key] for p in filtered_files)
-        )
+            # Global select all
+            all_files = set()
+            for root in self.tree.values():
+                all_files.update(self._get_all_files(root))
+            all_selected = len(all_files) > 0 and self.selected_files.issuperset(all_files)
 
-        # Avoid modifying widget state directly; use callbacks instead
-        def toggle_select_all():
-            if st.session_state[self.select_all_key]:
-                st.session_state[self.selected_key] = list(filtered_files)
-            else:
-                st.session_state[self.selected_key] = [
-                    p for p in st.session_state[self.selected_key] if p not in filtered_files
-                ]
+            def toggle_all():
+                if st.session_state["fts_select_all"]:
+                    self.selected_files.update(all_files)
+                else:
+                    self.selected_files.clear()
 
-        container.checkbox(
-            "Select All",
-            value=all_visible_selected,
-            key=self.select_all_key,
-            on_change=toggle_select_all,
-        )
+            container.checkbox(
+                "Select All Files",
+                key="fts_select_all",
+                value=all_selected,
+                on_change=toggle_all,
+            )
 
-        # --- Scrollable multi-select ---
-        # Streamlit multiselect is searchable & scrollable, but we apply height styling
-        container.markdown(
-            """
-            <style>
-            div[data-baseweb="select"] > div {
-                max-height: 400px;
-                overflow-y: auto;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
+            # Render filtered tree
+            for root_name, root_node in sorted(self.tree.items()):
+                filtered_node = self._filter_tree(root_node, search_query)
+                if filtered_node:
+                    self._render_node(filtered_node, level=0)
 
-        selected = container.multiselect(
-            "📂 Files",
-            options=filtered_files,
-            default=[p for p in st.session_state[self.selected_key] if p in filtered_files],
-            format_func=lambda p: self.labels.get(p, p),
-            key=f"{self.key_prefix}_multiselect",
-            placeholder="Search or scroll files...",
-        )
+            container.caption(f"**{len(self.selected_files)}** files selected")
 
-        # Sync selection
-        st.session_state[self.selected_key] = selected
-
-        # --- Count footer ---
-        container.caption(f"**{len(selected)}** file(s) selected")
-
-        return selected
-
-
+        return list(self.selected_files)
 
 

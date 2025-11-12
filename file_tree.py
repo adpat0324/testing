@@ -1,331 +1,240 @@
-class FileTreeSelector:
-    """
-    Flat, searchable, scrollable file selector with a real Select All toggle.
-    Updated to avoid modifying Streamlit widget keys after creation.
-    """
+# file_tree.py
+from __future__ import annotations
+from typing import Dict, List, Set, Optional
+import re
+import streamlit as st
 
-    def __init__(self, file_metadata: Dict[str, Dict], *, state_key: str = "fts"):
-        self.file_metadata = file_metadata or {}
-        self.state_key = state_key
+# -----------------------------
+# Tree data structures
+# -----------------------------
+class FileNode:
+    """Represents a node in the file tree (folder or file)."""
+    def __init__(self, name: str, is_file: bool = False, file_path: Optional[str] = None):
+        self.name = name
+        self.is_file = is_file
+        self.file_path = file_path  # Full file_path for selection
+        self.children: Dict[str, "FileNode"] = {}
 
-        # Build stable option list
-        self.options: List[str] = sorted(
-            self.file_metadata.keys(),
-            key=lambda p: (self.file_metadata.get(p, {}).get("file_name") or p).lower()
-        )
-
-        # Labels for display
-        self.labels = {
-            p: self.file_metadata.get(p, {}).get("file_name") or p
-            for p in self.options
-        }
-
-        # Session keys — note: _all_key is ONLY controlled by checkbox callback
-        self._sel_key = f"{self.state_key}_selected"        # list of selected paths
-        self._all_key = f"{self.state_key}_select_all"      # widget checkbox
-        self._ms_key  = f"{self.state_key}_multiselect"     # widget list
-
-        # We use a derived state, NOT the widget key, for internal sync logic
-        self._computed_all = f"{self.state_key}_computed_all"
-
-        # Initialize session state safely
-        ss = st.session_state
-        ss.setdefault(self._sel_key, [])
-        ss.setdefault(self._all_key, False)      # widget controls this
-        ss.setdefault(self._ms_key, [])
-        ss.setdefault(self._computed_all, False)
-
-    # ----------------------------------------------------------------------
-    # ❗ No longer touches st.session_state[self._all_key] directly
-    # Only computes whether all should be checked
-    # ----------------------------------------------------------------------
-    def _compute_select_all(self):
-        ss = st.session_state
-        all_selected = (
-            len(ss[self._sel_key]) == len(self.options) and len(self.options) > 0
-        )
-        ss[self._computed_all] = all_selected  # safe, not a widget key
-
-    # ----------------------------------------------------------------------
-    # ✅ Only legal place to modify st.session_state[self._all_key] or selection
-    # ----------------------------------------------------------------------
-    def _on_select_all_toggle(self):
-        ss = st.session_state
-        if ss[self._all_key]:  # user checked "Select All"
-            ss[self._sel_key] = list(self.options)
-            ss[self._ms_key]  = list(self.options)
-        else:                  # user unchecked it
-            ss[self._sel_key] = []
-            ss[self._ms_key]  = []
-
-    # ----------------------------------------------------------------------
-    def render(self, container=None) -> List[str]:
-        if container is None:
-            container = st
-
-        ss = st.session_state
-
-        # Before rendering widgets, compute whether all should be selected.
-        # This does NOT touch the widget key.
-        self._compute_select_all()
-
-        # ------------------------------------------------------
-        # ✅ SELECT ALL CHECKBOX (widget key must NOT be overwritten later)
-        # ------------------------------------------------------
-        container.checkbox(
-            "Select All",
-            key=self._all_key,
-            value=ss[self._all_key],  # widget owns this
-            on_change=self._on_select_all_toggle,
-            help="Toggle to select/unselect all files."
-        )
-
-        # ------------------------------------------------------
-        # ✅ MULTISELECT (searchable + scrollable)
-        # ------------------------------------------------------
-        container.markdown("""
-            <style>
-            div[data-baseweb="select"] > div { max-height: 380px; overflow-y: auto; }
-            </style>
-        """, unsafe_allow_html=True)
-
-        selected = container.multiselect(
-            "Pick Documents",
-            options=self.options,
-            default=ss[self._sel_key],
-            key=self._ms_key,
-            format_func=lambda p: self.labels.get(p, p),
-            placeholder="Search files…"
-        )
-
-        # Update selected state only (legal)
-        ss[self._sel_key] = selected
-
-        # Recompute "computed all" (indirect state)
-        self._compute_select_all()
-
-        # Now update the widget state if it is OUT OF SYNC
-        # Must be done BEFORE the next render cycle triggers the widget
-        if ss[self._all_key] != ss[self._computed_all]:
-            ss[self._all_key] = ss[self._computed_all]
-
-        # Footer count
-        container.caption(f"**{len(selected)} files selected**")
-
-        return selected
-
-
+    def add_child(self, name: str, is_file: bool = False, file_path: Optional[str] = None) -> "FileNode":
+        if name not in self.children:
+            self.children[name] = FileNode(name, is_file, file_path)
+        return self.children[name]
 
 
 class FileTreeBuilder:
-    """Builds a flat file list from metadata (no hierarchy)."""
+    """
+    Build a hierarchical tree structure from file metadata.
 
+    file_metadata: Dict[file_path, metadata dict]
+      Expected keys if available: 'sitePath', 'siteName', 'driveName', 'parentPath'
+    """
     @staticmethod
-    def build_tree(file_metadata: Dict[str, Dict]) -> Dict[str, "FileNode"]:
-        """
-        Returns a flat dictionary: { file_name: FileNode }
-        """
-        tree = {}
+    def build_tree(file_metadata: Dict[str, Dict]) -> Dict[str, FileNode]:
+        roots: Dict[str, FileNode] = {}
+
         for file_path, metadata in file_metadata.items():
-            file_name = metadata.get("fileName") or metadata.get("file_name") or file_path
-            tree[file_name] = FileNode(
-                name=file_name,
-                is_file=True,
-                file_path=file_path
-            )
-        return tree
+            site_path = metadata.get("sitePath")
+            site_name = metadata.get("siteName")
+            drive_name = metadata.get("driveName")
+            parent_path = metadata.get("parentPath")
 
+            # SharePoint hierarchy
+            if site_path and drive_name:
+                root_name = f"SharePoint: {site_name if site_name else site_path}"
+                if root_name not in roots:
+                    roots[root_name] = FileNode(root_name)
 
-class FileTreeSelector:
-    """Interactive flat file selector with checkboxes + search + scroll UI."""
+                current = roots[root_name]
+                current = current.add_child(f"📁 {drive_name}")
 
-    def __init__(self, file_metadata: Dict[str, Dict]):
-        self.file_metadata = file_metadata
-        self.tree = FileTreeBuilder.build_tree(file_metadata)
+                # Parent folders (split on '/')
+                if parent_path:
+                    for part in filter(None, parent_path.strip("/").split("/")):
+                        current = current.add_child(f"📂 {part}")
 
-        self.selected_files: Set[str] = set()
-        self.checkbox_states: Dict[str, bool] = {}
+                # The file
+                current.add_child(f"📄 {file_path}", is_file=True, file_path=file_path)
 
-    def render(self, container=None) -> List[str]:
-        if container is None:
-            container = st
+            else:
+                # Flat "Other Files"
+                root_name = "Other Files"
+                if root_name not in roots:
+                    roots[root_name] = FileNode(root_name)
+                roots[root_name].add_child(f"📄 {file_path}", is_file=True, file_path=file_path)
 
-        st.subheader("📁 Select Knowledge Base Files")
+        return roots
 
-        # -----------------------------
-        # ✅ SEARCH BAR
-        # -----------------------------
-        search_term = container.text_input("Search files", value="", key="file_search").lower()
-
-        # Filter files
-        filtered_files = {
-            name: node for name, node in self.tree.items()
-            if search_term in name.lower()
-        }
-
-        # -----------------------------
-        # ✅ SELECT ALL CHECKBOX
-        # -----------------------------
-        select_all = container.checkbox("Select All Files", key="select_all_files")
-
-        if select_all:
-            # Mark all checkbox states true
-            for name, node in filtered_files.items():
-                self.checkbox_states[node.file_path] = True
-            self.selected_files = {node.file_path for node in filtered_files.values()}
-        else:
-            # User unchecked select-all → unselect all only if previously selected
-            if len(self.selected_files) == len(filtered_files):
-                self.selected_files = set()
-                for node in filtered_files.values():
-                    self.checkbox_states[node.file_path] = False
-
-        # -----------------------------
-        # ✅ SCROLLABLE CHECKBOX AREA
-        # -----------------------------
-        with container.container():
-            container.write("")  # small visual padding
-
-            # Create scroll box
-            scroll_container = container.container()
-            scroll_container.markdown(
-                """
-                <div style="height:300px; overflow-y:scroll; border:1px solid #DDD; padding:10px;">
-                """,
-                unsafe_allow_html=True
-            )
-
-            # Render checkboxes inside scroll box
-            for file_name, node in sorted(filtered_files.items()):
-                current_state = self.checkbox_states.get(node.file_path, False)
-                new_state = container.checkbox(
-                    file_name,
-                    value=current_state,
-                    key=f"chk_{node.file_path}"
-                )
-
-                self.checkbox_states[node.file_path] = new_state
-                if new_state:
-                    self.selected_files.add(node.file_path)
-                else:
-                    self.selected_files.discard(node.file_path)
-
-            # Close scrollable div
-            container.markdown("</div>", unsafe_allow_html=True)
-
-        # Count
-        container.caption(f"✅ **{len(self.selected_files)} files selected**")
-
-        return list(self.selected_files)
-
-
-
-
-
-
-# app/config/file_tree.py
-
-from typing import Dict, List, Optional
-import streamlit as st
-
+# -----------------------------
+# Selector component
+# -----------------------------
 class FileTreeSelector:
     """
-    Flat, searchable, scrollable file selector with a true Select All toggle.
-    API-compatible with your previous selector:
-      selected = FileTreeSelector(file_metadata).render(container) -> List[str]
+    Interactive file tree selector with search and a working Select All that applies
+    to the *visible* files (after filtering).
+
+    Usage:
+        file_metadata = index_manager.get_file_metadata()
+        selector = FileTreeSelector(file_metadata, state_key="fts")
+        selected_paths = selector.render(container=st.sidebar)
     """
 
     def __init__(self, file_metadata: Dict[str, Dict], *, state_key: str = "fts"):
         self.file_metadata = file_metadata or {}
+        self.tree = FileTreeBuilder.build_tree(self.file_metadata)
         self.state_key = state_key
 
-        # Build stable option list + labels
-        # options are file_paths; labels display file names (fallback to path)
-        self.options: List[str] = sorted(
-            self.file_metadata.keys(),
-            key=lambda p: (self.file_metadata.get(p, {}).get("file_name") or p).lower()
-        )
-        self.labels = {
-            p: self.file_metadata.get(p, {}).get("file_name") or p for p in self.options
-        }
+        # Session keys (none of these are widget keys, so we can freely write to them)
+        self._sel_set_key = f"{self.state_key}_selected_set"     # Set[str]
+        self._search_key  = f"{self.state_key}_search"            # str
+        self._sel_all_key = f"{self.state_key}_select_all"        # widget key (read-only by us)
+        self._sel_all_trg = f"{self.state_key}_select_all_trig"   # bool trigger set by on_change
+        self._last_query  = f"{self.state_key}_last_query"        # last applied query
 
-        # Session keys
-        self._sel_key = f"{self.state_key}_selected"
-        self._all_key = f"{self.state_key}_select_all"
-        self._ms_key  = f"{self.state_key}_multiselect"
+        if self._sel_set_key not in st.session_state:
+            st.session_state[self._sel_set_key] = set()  # type: ignore[assignment]
+        if self._search_key not in st.session_state:
+            st.session_state[self._search_key] = ""
+        if self._sel_all_trg not in st.session_state:
+            st.session_state[self._sel_all_trg] = False
+        if self._last_query not in st.session_state:
+            st.session_state[self._last_query] = ""
 
-        # Init session state defaults once
-        if self._sel_key not in st.session_state:
-            st.session_state[self._sel_key] = []
-        if self._all_key not in st.session_state:
-            st.session_state[self._all_key] = False
-        if self._ms_key not in st.session_state:
-            st.session_state[self._ms_key] = []
+    # ---------- filtering ----------
+    @staticmethod
+    def _matches(text: str, query: str) -> bool:
+        if not query:
+            return True
+        return query.lower() in text.lower()
 
-    def _sync_select_all_checkbox(self):
-        """Keep the 'Select All' checkbox in sync with current selection size."""
-        all_selected = len(st.session_state[self._sel_key]) == len(self.options) and len(self.options) > 0
-        st.session_state[self._all_key] = all_selected
+    def _file_label(self, node: FileNode) -> str:
+        # Prefer display name from metadata if present, else node.name (already prefixed with icons)
+        if node.file_path and node.file_path in self.file_metadata:
+            meta = self.file_metadata[node.file_path]
+            return meta.get("file_name") or node.name
+        return node.name
 
-    def _on_select_all_toggle(self):
-        """Callback when 'Select All' is toggled: set selection accordingly."""
-        if st.session_state[self._all_key]:
-            st.session_state[self._sel_key] = list(self.options)
-            st.session_state[self._ms_key]  = list(self.options)
-        else:
-            st.session_state[self._sel_key] = []
-            st.session_state[self._ms_key]  = []
+    def _filter_tree(self, node: FileNode, query: str) -> Optional[FileNode]:
+        """
+        Keep node if:
+          - it's a FILE and file label/path matches query
+          - it's a FOLDER with ANY matching descendant
+        If a folder name matches the query, we *still only include matching descendants*
+        (to avoid dumping the entire folder as you requested).
+        """
+        if node.is_file:
+            label = self._file_label(node)
+            if self._matches(label, query) or self._matches(node.file_path or "", query):
+                return FileNode(label, True, node.file_path)
+            return None
+
+        # Folder: check children recursively
+        filtered_children: Dict[str, FileNode] = {}
+        for child in node.children.values():
+            filtered = self._filter_tree(child, query)
+            if filtered:
+                filtered_children[filtered.name] = filtered
+
+        if filtered_children:
+            new_node = FileNode(node.name, False, None)
+            new_node.children = filtered_children
+            return new_node
+
+        return None
+
+    def _collect_visible_files(self, node: FileNode) -> List[str]:
+        """Collect file_paths of *visible* files under filtered node."""
+        stack = [node]
+        out: List[str] = []
+        while stack:
+            cur = stack.pop()
+            if cur.is_file and cur.file_path:
+                out.append(cur.file_path)
+            stack.extend(cur.children.values())
+        return out
+
+    # ---------- select-all callback ----------
+    def _on_select_all_changed(self):
+        # We don't mutate the checkbox state itself; just trigger handling in render()
+        st.session_state[self._sel_all_trg] = True
+
+    # ---------- rendering ----------
+    def _render_node(self, node: FileNode, level: int = 0):
+        """Render a node (checkbox for files, expander for folders)."""
+        if node.is_file and node.file_path:
+            key = f"{self.state_key}_cb::{node.file_path}"
+            checked = node.file_path in st.session_state[self._sel_set_key]
+            if st.checkbox(self._file_label(node), value=checked, key=key):
+                st.session_state[self._sel_set_key].add(node.file_path)
+            else:
+                st.session_state[self._sel_set_key].discard(node.file_path)
+            return
+
+        # Folder
+        with st.expander(node.name, expanded=(level < 1)):
+            for child in sorted(node.children.values(), key=lambda n: n.name.lower()):
+                self._render_node(child, level + 1)
 
     def render(self, container: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
-        """
-        Render the selector and return the list of selected file paths.
-        """
+        """Render the complete file tree and return selected file paths."""
         if container is None:
             container = st
 
-        # --- Controls header
-        with container.container():
-            # A slim header row with Select All (kept in sync)
-            self._sync_select_all_checkbox()
-            container.checkbox(
-                "Select All",
-                key=self._all_key,
-                value=st.session_state[self._all_key],
-                on_change=self._on_select_all_toggle,
-                help="Toggle to select/unselect all files in the list."
-            )
+        with container:
+            # Search (kept simple & fast)
+            query = st.text_input("🔎 Search files", value=st.session_state[self._search_key], key=self._search_key).strip()
+            filtered_roots: Dict[str, FileNode] = {}
+            for root_name in sorted(self.tree.keys()):
+                filtered = self._filter_tree(self.tree[root_name], query)
+                if filtered:
+                    filtered_roots[root_name] = filtered
 
-        # --- Searchable, scrollable multi-select
-        # st.multiselect is searchable and scrollable by default.
-        # We keep it in a container with a fixed max height via simple CSS.
-        with container.container():
-            # Optional: cap height of the widget’s area
-            container.markdown(
+            # CSS cap for the scroll area
+            st.markdown(
                 """
                 <style>
-                div[data-baseweb="select"] > div { max-height: 380px; overflow-y: auto; }
+                  .fts-scroll { max-height: 380px; overflow-y: auto; padding-right: .25rem; }
                 </style>
                 """,
                 unsafe_allow_html=True,
             )
 
-            selected = container.multiselect(
-                "Pick Documents",
-                options=self.options,
-                default=st.session_state[self._sel_key],
-                key=self._ms_key,
-                format_func=lambda p: self.labels.get(p, p),
-                placeholder="Search files…"
+            # Select All (works on *visible* files only)
+            st.checkbox(
+                "Select All (visible)",
+                key=self._sel_all_key,
+                on_change=self._on_select_all_changed,
+                help="Toggle to select/unselect all files currently visible (after search).",
             )
 
-        # Persist & sync state
-        st.session_state[self._sel_key] = selected
-        self._sync_select_all_checkbox()
+            # If toggled, update the selection set based on visible files
+            if st.session_state[self._sel_all_trg]:
+                visible: List[str] = []
+                for root in filtered_roots.values():
+                    visible.extend(self._collect_visible_files(root))
 
-        # Footer count
-        container.caption(f"**{len(selected)}** files selected")
+                if st.session_state[self._sel_all_key]:
+                    # Select all visible
+                    st.session_state[self._sel_set_key] = set(visible)
+                else:
+                    # Unselect all visible (leave others as-is)
+                    st.session_state[self._sel_set_key] -= set(visible)
 
-        return selected
+                # reset trigger
+                st.session_state[self._sel_all_trg] = False
+
+            # Render the filtered tree inside a scrollable area
+            scroll = st.container()
+            with scroll:
+                st.markdown('<div class="fts-scroll">', unsafe_allow_html=True)
+                for root_name in sorted(filtered_roots.keys()):
+                    self._render_node(filtered_roots[root_name], level=0)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            # Footer count
+            selected = sorted(st.session_state[self._sel_set_key])
+            st.caption(f"**{len(selected)}** files selected")
+
+            return selected
 
 
 

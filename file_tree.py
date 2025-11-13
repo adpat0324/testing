@@ -199,7 +199,10 @@ class FileTreeSelector:
             # Ensure folder checkbox state is initialised prior to widget
             # creation to avoid Streamlit's post-instantiation mutation error.
             if folder_key not in self._checkbox_states:
-                self._checkbox_states[folder_key] = st.session_state.get(folder_key, False)
+                inferred_state = st.session_state.get(folder_key, False)
+                if parent_selected and not inferred_state:
+                    inferred_state = True
+                self._checkbox_states[folder_key] = inferred_state
 
             if folder_key not in st.session_state:
                 st.session_state[folder_key] = self._checkbox_states[folder_key]

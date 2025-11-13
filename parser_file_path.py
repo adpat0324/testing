@@ -20,9 +20,26 @@ def _extract_metadata(self, f) -> dict:
 
     return meta
 
+# Enrich metadata with SharePoint info if available
+enriched_docs = []
+for item in documents:
+    meta = item.get("metadata", {}).copy()
 
-meta = self._extract_metadata(f)
-doc = LlamaIndexDocument(text=file_text, metadata=meta)
-self.logger.info(
-    f"Parsed {f.name} | site={meta.get('sitePath')} | drive={meta.get('driveName')} | parent={meta.get('parentPath')}"
-)
+    # If SharePoint metadata exists, merge it
+    if "file" in item and hasattr(item["file"], "metadata"):
+        try:
+            sp_meta = asdict(item["file"].metadata)
+            meta.update({
+                "sitePath": sp_meta.get("sitePath", ""),
+                "driveName": sp_meta.get("driveName", ""),
+                "parentPath": sp_meta.get("parentPath", ""),
+                "webUrl": sp_meta.get("webUrl", ""),
+                "downloadUrl": sp_meta.get("downloadUrl", ""),
+            })
+        except Exception as e:
+            self.logger.warning(f"Failed to enrich metadata for {item.get('file')}: {e}")
+
+    doc = LlamaIndexDocument(text=item["markdown"], metadata=meta)
+    enriched_docs.append(doc)
+
+llama_documents = enriched_docs

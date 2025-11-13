@@ -199,24 +199,16 @@ class FileTreeSelector:
         expanded = level == 0 or bool(search_query)
         with container.expander(node.name, expanded=expanded):
             folder_key = self._folder_checkbox_key(parent_key, node.name)
-            current_path = f"{parent_key}/{node.name}" if parent_key else node.name
+            previous_state = self._checkbox_states.get(folder_key, False)
+            folder_selected = container.checkbox("Select all", key=folder_key, value=previous_state)
 
-            # Ensure folder checkbox state is initialised prior to widget
-            # creation to avoid Streamlit's post-instantiation mutation error.
-            if folder_key not in self._checkbox_states:
-                self._checkbox_states[folder_key] = st.session_state.get(folder_key, False)
-
-            if folder_key not in st.session_state:
-                st.session_state[folder_key] = self._checkbox_states[folder_key]
-
-            if parent_selected and not st.session_state[folder_key]:
+            if parent_selected and not folder_selected:
+                folder_selected = True
                 st.session_state[folder_key] = True
 
-            folder_selected = container.checkbox("Select all", key=folder_key)
-
-            previous_state = self._checkbox_states.get(folder_key, False)
             if folder_selected != previous_state:
                 self._checkbox_states[folder_key] = folder_selected
+                current_path = f"{parent_key}/{node.name}" if parent_key else node.name
                 self._set_files_under_node(node, folder_selected, current_path)
             else:
                 self._checkbox_states.setdefault(folder_key, folder_selected)

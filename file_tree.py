@@ -233,6 +233,13 @@ class FileTreeSelector:
         if container is None:
             container = st
 
+        # Rebuild selected files from widget state so deselections propagate.
+        self.selected_files = {
+            key.split("::", 1)[1]
+            for key, value in st.session_state.items()
+            if key.startswith("file::") and value
+        }
+
         # Search bar
         search_query = container.text_input("🔎 Search files", "").strip().lower()
 

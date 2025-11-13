@@ -1,168 +1,244 @@
-from typing import Dict, List, Optional, Set
+"""
+file_tree.py
+
+Hierarchical file tree builder and Streamlit selector for RAG knowledge base files.
+Supports nested folders, per-folder “Select All”, global “Select All”,
+and recursive search that expands only matching branches.
+"""
+
+from typing import Dict, List, Set, Optional
 import streamlit as st
 
 
+# -----------------------------------------------------------------------------
+# File Node
+# -----------------------------------------------------------------------------
 class FileNode:
     """Represents a node in the file tree (folder or file)."""
+
     def __init__(self, name: str, is_file: bool = False, file_path: Optional[str] = None):
         self.name = name
         self.is_file = is_file
-        self.file_path = file_path
+        self.file_path = file_path  # Full path for file nodes
         self.children: Dict[str, "FileNode"] = {}
 
     def add_child(self, name: str, is_file: bool = False, file_path: Optional[str] = None) -> "FileNode":
-        """Add or get a child node."""
+        """Add a child node if not already present."""
         if name not in self.children:
             self.children[name] = FileNode(name, is_file, file_path)
         return self.children[name]
 
 
-class FileTreeSelector:
-    """Interactive hierarchical file tree selector with search, scroll, and working select-all."""
+# -----------------------------------------------------------------------------
+# File Tree Builder
+# -----------------------------------------------------------------------------
+class FileTreeBuilder:
+    """Builds a hierarchical file tree from file metadata."""
 
-    def __init__(self, file_metadata: Dict[str, Dict]):
-        self.file_metadata = file_metadata or {}
-        self.tree: Dict[str, FileNode] = self._build_tree(file_metadata)
-        self.selected_files: Set[str] = set()
+    @staticmethod
+    def build_tree(file_metadata: Dict[str, Dict]) -> Dict[str, FileNode]:
+        """
+        Build a tree from file metadata.
 
-    # --------------------------------------------------------------------------
-    # Build a hierarchical tree from file metadata
-    def _build_tree(self, file_metadata: Dict[str, Dict]) -> Dict[str, FileNode]:
+        Args:
+            file_metadata: Mapping file_path -> metadata dict
+
+        Returns:
+            Dict mapping root category name -> FileNode
+        """
         roots: Dict[str, FileNode] = {}
 
         for file_path, metadata in file_metadata.items():
-            # Split by slashes to form hierarchy
-            parts = [p for p in file_path.strip("/").split("/") if p]
-            if not parts:
-                continue
+            site_path = metadata.get("sitePath")
+            site_name = metadata.get("siteName")
+            drive_name = metadata.get("driveName")
+            parent_path = metadata.get("parentPath")
 
-            root_name = parts[0]
-            if root_name not in roots:
-                roots[root_name] = FileNode(root_name)
+            if site_path and drive_name:
+                # Build SharePoint hierarchy
+                root_name = f"SharePoint: {site_name}" if site_name else site_path
+                if root_name not in roots:
+                    roots[root_name] = FileNode(root_name)
 
-            current = roots[root_name]
-            for part in parts[1:-1]:
-                current = current.add_child(part)
-            current.add_child(parts[-1], is_file=True, file_path=file_path)
+                current = roots[root_name].add_child(drive_name)
+                if parent_path:
+                    for part in parent_path.strip("/").split("/"):
+                        if part:
+                            current = current.add_child(part)
+
+                current.add_child(file_path, is_file=True, file_path=file_path)
+
+            else:
+                # Other / flat structure
+                root_name = "Other Files"
+                if root_name not in roots:
+                    roots[root_name] = FileNode(root_name)
+                roots[root_name].add_child(file_path, is_file=True, file_path=file_path)
 
         return roots
 
-    # --------------------------------------------------------------------------
-    # Recursive search
-    def _filter_tree(self, node: FileNode, query: str) -> Optional[FileNode]:
-        """Return filtered copy of node that matches query or has matching descendants."""
-        if not query:
-            return node
 
-        clean_query = query.lower()
-        match_self = clean_query in node.name.lower()
+# -----------------------------------------------------------------------------
+# File Tree Selector (Streamlit)
+# -----------------------------------------------------------------------------
+class FileTreeSelector:
+    """Interactive file tree selector with search and multi-level checkboxes."""
 
-        filtered_children = {}
-        for child_name, child in node.children.items():
-            filtered_child = self._filter_tree(child, query)
-            if filtered_child:
-                filtered_children[child_name] = filtered_child
+    def __init__(self, file_metadata: List[Dict]):
+        self.file_metadata = self._iter_items(file_metadata)
+        self.tree = FileTreeBuilder.build_tree(self.file_metadata)
+        self.selected_files: Set[str] = set()
 
-        if match_self or filtered_children:
-            new_node = FileNode(node.name, node.is_file, node.file_path)
-            new_node.children = filtered_children
-            return new_node
+    # -------------------------------------------------------------------------
+    # Utilities
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _iter_items(file_metadata: List[Dict]) -> Dict[str, Dict]:
+        """Convert list of metadata dicts to path->metadata mapping."""
+        out: Dict[str, Dict] = {}
+        for md in file_metadata:
+            if not isinstance(md, dict):
+                continue
+            fp = md.get("file_path")
+            if fp:
+                out[fp] = md
+        return out
 
-        return None
-
-    def _get_all_files(self, node: FileNode) -> Set[str]:
+    def _get_all_files_in_node(self, node: FileNode) -> Set[str]:
         """Recursively collect all file paths under a node."""
         files = set()
-        if node.is_file and node.file_path:
+        if node.file_path:
             files.add(node.file_path)
         for child in node.children.values():
-            files.update(self._get_all_files(child))
+            files.update(self._get_all_files_in_node(child))
         return files
 
-    # --------------------------------------------------------------------------
-    # Recursive renderer
-    def _render_node(self, node: FileNode, level: int = 0, parent_selected: bool = False):
-        """Render each folder/file recursively with checkboxes."""
-        indent = " " * level  # Unicode em space for hierarchy indentation
+    def _node_matches_search(self, node: FileNode, query: str) -> bool:
+        """True if node or any descendant name contains query."""
+        q = query.lower()
+        if q in node.name.lower():
+            return True
+        return any(self._node_matches_search(c, query) for c in node.children.values())
 
-        if node.is_file:
-            checked = node.file_path in self.selected_files or parent_selected
-            if st.checkbox(f"{indent}📄 {node.name}", value=checked, key=node.file_path):
-                self.selected_files.add(node.file_path)
-            else:
-                self.selected_files.discard(node.file_path)
-        else:
-            # Folder expander with “Select all in folder”
-            with st.expander(f"{indent}📁 {node.name}", expanded=False):
-                folder_files = self._get_all_files(node)
-                folder_selected = all(f in self.selected_files for f in folder_files)
+    def _matching_children(self, node: FileNode, query: str) -> List[FileNode]:
+        """Return only children that match search (or have matching descendants)."""
+        if not query:
+            return list(node.children.values())
+        return [c for c in node.children.values() if self._node_matches_search(c, query)]
 
-                # Use callback-safe checkbox
-                def toggle_folder():
-                    if st.session_state[f"{node.name}_select_all"]:
-                        self.selected_files.update(folder_files)
-                    else:
-                        self.selected_files.difference_update(folder_files)
+    def _highlight(self, name: str, query: str) -> str:
+        """Bold matching substring."""
+        q = query.lower()
+        i = name.lower().find(q)
+        if i == -1:
+            return name
+        return f"{name[:i]}**{name[i:i+len(q)]}**{name[i+len(q):]}"
 
-                st.checkbox(
-                    "Select all in folder",
-                    key=f"{node.name}_select_all",
-                    value=folder_selected,
-                    on_change=toggle_folder,
-                )
-
-                for child in sorted(node.children.values(), key=lambda n: n.name.lower()):
-                    self._render_node(child, level + 1, parent_selected=folder_selected)
-
-    # --------------------------------------------------------------------------
-    def render(self, container: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
-        """Main renderer entry point."""
+    # -------------------------------------------------------------------------
+    # Recursive Renderer
+    # -------------------------------------------------------------------------
+    def _render_node(
+        self,
+        node: FileNode,
+        level: int = 0,
+        parent_key: str = "",
+        parent_selected: bool = False,
+        container=None,
+        search_query: str = ""
+    ) -> None:
+        """Recursively render node (folder or file) with checkboxes."""
         if container is None:
             container = st
 
-        # Search input
-        search_query = container.text_input("🔍 Search files and folders", "").strip()
+        # FILE NODE
+        if node.file_path:
+            key = f"file_{node.file_path}"
+            default_checked = parent_selected or (node.file_path in self.selected_files)
+            label = self._highlight(node.name, search_query) if search_query else node.name
+            checked = container.checkbox(label, key=key, value=default_checked)
+            if checked:
+                self.selected_files.add(node.file_path)
+            else:
+                self.selected_files.discard(node.file_path)
+            return
 
-        # Scrollable container
-        with container.container():
-            container.markdown(
-                """
-                <style>
-                div[data-testid="stVerticalBlock"] div[data-testid="stVerticalBlock"] {
-                    max-height: 450px;
-                    overflow-y: auto;
-                    padding-right: 0.5rem;
-                }
-                </style>
-                """,
-                unsafe_allow_html=True,
+        # FOLDER NODE
+        children_to_render = self._matching_children(node, search_query)
+        if search_query and not children_to_render and search_query not in node.name.lower():
+            return
+
+        exp_label = self._highlight(node.name, search_query) if search_query else node.name
+        expanded = (level < 1) or bool(search_query)
+        with container.expander(exp_label, expanded=expanded):
+            # Select all in folder
+            sel_key = f"folder_{parent_key}_{node.name}_select_all"
+            prev_val = st.session_state.get(sel_key, False)
+            folder_selected = container.checkbox(
+                f"Select all in '{node.name}'",
+                key=sel_key,
+                value=prev_val
             )
 
-            # Global select all
-            all_files = set()
-            for root in self.tree.values():
-                all_files.update(self._get_all_files(root))
-            all_selected = len(all_files) > 0 and self.selected_files.issuperset(all_files)
+            folder_files = self._get_all_files_in_node(node)
+            if folder_selected and not prev_val:
+                self.selected_files.update(folder_files)
+            elif (not folder_selected) and prev_val:
+                self.selected_files.difference_update(folder_files)
 
-            def toggle_all():
-                if st.session_state["fts_select_all"]:
-                    self.selected_files.update(all_files)
-                else:
-                    self.selected_files.clear()
+            st.session_state[sel_key] = folder_selected
 
-            container.checkbox(
-                "Select All Files",
-                key="fts_select_all",
-                value=all_selected,
-                on_change=toggle_all,
+            for child in sorted(children_to_render, key=lambda c: c.name.lower()):
+                self._render_node(
+                    child,
+                    level + 1,
+                    f"{parent_key}/{node.name}",
+                    parent_selected=folder_selected or parent_selected,
+                    container=container,
+                    search_query=search_query,
+                )
+
+    # -------------------------------------------------------------------------
+    # Main Renderer
+    # -------------------------------------------------------------------------
+    def render(self, container=None) -> List[str]:
+        """Render the entire tree and return selected file paths."""
+        if container is None:
+            container = st
+
+        # --- Search bar
+        search_query = container.text_input("🔎 Search files", "").strip().lower()
+
+        # --- Global select all
+        all_files = set()
+        for root in self.tree.values():
+            all_files.update(self._get_all_files_in_node(root))
+
+        global_key = "select_all_global"
+        prev_global = st.session_state.get(global_key, False)
+        now_global = container.checkbox("Select All Files", key=global_key, value=prev_global)
+
+        if now_global and not prev_global:
+            self.selected_files = set(all_files)
+        elif (not now_global) and prev_global:
+            self.selected_files.clear()
+
+        st.session_state[global_key] = now_global
+
+        # --- Render roots
+        root_names = sorted(self.tree.keys(), key=lambda x: (x == "Other Files", x.lower()))
+        for root_name in root_names:
+            root = self.tree[root_name]
+            if search_query and not self._node_matches_search(root, search_query):
+                continue
+            self._render_node(
+                root,
+                level=0,
+                parent_key="root",
+                parent_selected=now_global,
+                container=container,
+                search_query=search_query
             )
 
-            # Render filtered tree
-            for root_name, root_node in sorted(self.tree.items()):
-                filtered_node = self._filter_tree(root_node, search_query)
-                if filtered_node:
-                    self._render_node(filtered_node, level=0)
-
-            container.caption(f"**{len(self.selected_files)}** files selected")
-
+        # --- Footer
+        container.caption(f"**{len(self.selected_files)}** files selected")
         return list(self.selected_files)

@@ -140,7 +140,7 @@ class FileTreeSelector:
             return True
         return any(self._node_matches_search(child, query) for child in node.children.values())
 
-    def _set_files_under_node(self, node: FileNode, value: bool, current_path: str = "") -> None:
+    def _set_files_under_node(self, node: FileNode, value: bool, parent_key: str = "") -> None:
         """Set all descendant nodes to the provided boolean value."""
         if node.is_file and node.file_path:
             key = self._file_checkbox_key(node.file_path)
@@ -152,13 +152,12 @@ class FileTreeSelector:
             return
 
         for child in node.children.values():
-            child_parent_key = current_path
-            child_path = f"{current_path}/{child.name}" if current_path else child.name
+            child_parent_key = f"{parent_key}/{node.name}" if parent_key else node.name
             if not child.is_file:
                 child_folder_key = self._folder_checkbox_key(child_parent_key, child.name)
                 st.session_state[child_folder_key] = value
                 self._checkbox_states[child_folder_key] = value
-            self._set_files_under_node(child, value, child_path)
+            self._set_files_under_node(child, value, child_parent_key)
 
     # ------------------------------------------------------------------
     # Recursive Renderer
@@ -168,6 +167,7 @@ class FileTreeSelector:
         node: FileNode,
         level: int = 0,
         parent_key: str = "",
+        parent_selected: bool = False,
         search_query: str = "",
         container=None,
     ) -> None:
@@ -177,6 +177,10 @@ class FileTreeSelector:
 
         if node.is_file and node.file_path:
             key = self._file_checkbox_key(node.file_path)
+            if parent_selected:
+                st.session_state[key] = True
+                self.selected_files.add(node.file_path)
+
             checked = container.checkbox(
                 node.name,
                 value=st.session_state.get(key, node.file_path in self.selected_files),
@@ -195,25 +199,27 @@ class FileTreeSelector:
         expanded = level == 0 or bool(search_query)
         with container.expander(node.name, expanded=expanded):
             folder_key = self._folder_checkbox_key(parent_key, node.name)
-            current_path = f"{parent_key}/{node.name}" if parent_key else node.name
-
-            # Ensure folder checkbox state is initialised prior to widget
-            # creation to avoid Streamlit's post-instantiation mutation error.
-            if folder_key not in self._checkbox_states:
-                inferred_state = st.session_state.get(folder_key, False)
-                if parent_selected and not inferred_state:
-                    inferred_state = True
-                self._checkbox_states[folder_key] = inferred_state
-
-            if folder_key not in st.session_state:
-                st.session_state[folder_key] = self._checkbox_states[folder_key]
-
-            folder_selected = container.checkbox("Select all", key=folder_key)
-
             previous_state = self._checkbox_states.get(folder_key, False)
+            folder_selected = container.checkbox("Select all", key=folder_key, value=previous_state)
+
+            if parent_selected and not folder_selected:
+                folder_selected = True
+                st.session_state[folder_key] = True
+
             if folder_selected != previous_state:
+                # Record new state
                 self._checkbox_states[folder_key] = folder_selected
+                current_path = f"{parent_key}/{node.name}" if parent_key else node.name
+                # Apply change to all descendants
                 self._set_files_under_node(node, folder_selected, current_path)
+            
+                # If unselecting, also clear all deeper folder checkboxes in state
+                if not folder_selected:
+                    for child in node.children.values():
+                        if not child.is_file:
+                            child_key = self._folder_checkbox_key(current_path, child.name)
+                            st.session_state[child_key] = False
+                            self._checkbox_states[child_key] = False
             else:
                 self._checkbox_states.setdefault(folder_key, folder_selected)
 
@@ -224,6 +230,7 @@ class FileTreeSelector:
                     child,
                     level=level + 1,
                     parent_key=f"{parent_key}/{node.name}" if parent_key else node.name,
+                    parent_selected=parent_selected or folder_selected,
                     search_query=search_query,
                     container=container,
                 )
@@ -256,8 +263,7 @@ class FileTreeSelector:
                 root_folder_key = self._folder_checkbox_key("root", root.name)
                 st.session_state[root_folder_key] = global_selected
                 self._checkbox_states[root_folder_key] = global_selected
-                root_path = f"root/{root.name}" if root.name else "root"
-                self._set_files_under_node(root, global_selected, root_path)
+                self._set_files_under_node(root, global_selected, "root")
         else:
             self._checkbox_states.setdefault(global_key, global_selected)
 
@@ -271,6 +277,7 @@ class FileTreeSelector:
                 root,
                 level=0,
                 parent_key="root",
+                parent_selected=global_selected,
                 search_query=search_query,
                 container=container,
             )

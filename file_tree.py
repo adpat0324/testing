@@ -6,7 +6,10 @@ Supports nested folders, per-folder “Select All”, global “Select All”,
 and recursive search that expands only matching branches.
 """
 
-from typing import Dict, List, Set, Optional
+from __future__ import annotations
+
+from typing import Dict, Iterable, List, Optional, Set
+
 import streamlit as st
 
 
@@ -23,7 +26,15 @@ class FileNode:
         """Add a child node if not already present."""
         if name not in self.children:
             self.children[name] = FileNode(name, is_file, file_path)
-        return self.children[name]
+        child = self.children[name]
+        if is_file:
+            child.is_file = True
+            child.file_path = file_path
+        return child
+
+    def iter_children_sorted(self) -> Iterable["FileNode"]:
+        for name in sorted(self.children):
+            yield self.children[name]
 
 
 class FileTreeBuilder:
@@ -48,6 +59,13 @@ class FileTreeBuilder:
             drive_name = metadata.get("driveName")
             parent_path = metadata.get("parentPath")
 
+            display_name = (
+                metadata.get("name")
+                or metadata.get("fileName")
+                or metadata.get("file_name")
+                or file_path.split("/")[-1]
+            )
+
             if site_path and drive_name:
                 # Build SharePoint hierarchy
                 root_name = f"SharePoint: {site_name}" if site_name else site_path
@@ -56,19 +74,20 @@ class FileTreeBuilder:
 
                 current = roots[root_name]
                 current = current.add_child(drive_name)
-                if parent_path:
-                    path_parts = parent_path.strip("/").split("/"):
-                        for part in path_parts:
-                            current = current.add_child(part)
 
-                current.add_child(file_path, is_file=True, file_path=file_path)
+                if parent_path:
+                    path_parts = [part for part in parent_path.strip("/").split("/") if part]
+                    for part in path_parts:
+                        current = current.add_child(part)
+
+                current.add_child(display_name, is_file=True, file_path=file_path)
 
             else:
                 # Other / flat structure
                 root_name = "Other Files"
                 if root_name not in roots:
                     roots[root_name] = FileNode(root_name)
-                roots[root_name].add_child(file_path, is_file=True, file_path=file_path)
+                roots[root_name].add_child(display_name, is_file=True, file_path=file_path)
 
         return roots
 
@@ -82,6 +101,9 @@ class FileTreeSelector:
         self.selected_files: Set[str] = set()
         self._checkbox_states: Dict[str, bool] = {}
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def _iter_items(file_metadata: List[Dict]) -> Dict[str, Dict]:
         """Convert list of metadata dicts to path->metadata mapping."""
@@ -89,85 +111,174 @@ class FileTreeSelector:
         for md in file_metadata:
             if not isinstance(md, dict):
                 continue
-            fp = md.get("file_path")
+            fp = md.get("file_path") or md.get("path")
             if fp:
                 out[fp] = md
         return out
 
+    def _file_checkbox_key(self, file_path: str) -> str:
+        return f"file::{file_path}"
+
+    def _folder_checkbox_key(self, parent_key: str, node_name: str) -> str:
+        return f"folder::{parent_key}/{node_name}"
+
     def _get_all_files_in_node(self, node: FileNode) -> Set[str]:
         """Recursively collect all file paths under a node."""
-        files = set()
+        files: Set[str] = set()
         if node.is_file and node.file_path:
             files.add(node.file_path)
-        else:
-            for child in node.children.values():
-                files.update(self._get_all_files_in_node(child))
+        for child in node.children.values():
+            files.update(self._get_all_files_in_node(child))
         return files
 
     def _node_matches_search(self, node: FileNode, query: str) -> bool:
         """True if node or any descendant name contains query."""
-        if q in node.name.lower():
+        if not query:
+            return True
+        lowered = node.name.lower()
+        if query in lowered:
             return True
         return any(self._node_matches_search(child, query) for child in node.children.values())
 
+    def _set_files_under_node(self, node: FileNode, value: bool, parent_key: str = "") -> None:
+        """Set all descendant nodes to the provided boolean value."""
+        if node.is_file and node.file_path:
+            key = self._file_checkbox_key(node.file_path)
+            st.session_state[key] = value
+            if value:
+                self.selected_files.add(node.file_path)
+            else:
+                self.selected_files.discard(node.file_path)
+            return
+
+        for child in node.children.values():
+            child_parent_key = f"{parent_key}/{node.name}" if parent_key else node.name
+            if not child.is_file:
+                child_folder_key = self._folder_checkbox_key(child_parent_key, child.name)
+                st.session_state[child_folder_key] = value
+                self._checkbox_states[child_folder_key] = value
+            self._set_files_under_node(child, value, child_parent_key)
+
+    # ------------------------------------------------------------------
     # Recursive Renderer
+    # ------------------------------------------------------------------
     def _render_node(
         self,
         node: FileNode,
         level: int = 0,
         parent_key: str = "",
         parent_selected: bool = False,
-        container=None) -> None:
+        search_query: str = "",
+        container=None,
+    ) -> None:
         """Recursively render node (folder or file) with checkboxes."""
         if container is None:
             container = st
 
-        # FILE NODE
-        if node.file_path:
-            key = f"file_{node.file_path}"
-            checked = parent_selected or (node.file_path in self.selected_files if node.file_path else False)
-            if container.checkbox(node.name, value=checked, key=key):
-                if node.file_path:
-                    self.selected_files.add(node.file_path)
-            elif node.file_path and node.file_oath in self.selected_files and not parent_selected:
+        if node.is_file and node.file_path:
+            key = self._file_checkbox_key(node.file_path)
+            if parent_selected:
+                st.session_state[key] = True
+                self.selected_files.add(node.file_path)
+
+            checked = container.checkbox(
+                node.name,
+                value=st.session_state.get(key, node.file_path in self.selected_files),
+                key=key,
+            )
+
+            if checked:
+                self.selected_files.add(node.file_path)
+            else:
                 self.selected_files.discard(node.file_path)
-        else:
-            if node.children:
-                with container.expander(node.name, expanded={level<1)):
-                    key = f"folder+{parent_key}_{node.name}_select_all"
-                    folder_selected = st.checkbox("Select all", key=key, value=False)
-                    if folder_selected:
-                        folder_files = self._get_all_files_in_node(node)
-                        self.selected_files.update(folder_files)
-                    else:
-                        folder_files = self._get_all_files_in_node(node)
-                        self.selected_files.difference_update(folder_files)
-                    for child_name in sorted(node.children.keys():
-                        self._render_node(node.children[child_name], level+1, f"{parent_key}_{node.name}", folder_selected, container)
-        
-    # -------------------------------------------------------------------------
+            return
+
+        if not node.children:
+            return
+
+        expanded = level == 0 or bool(search_query)
+        with container.expander(node.name, expanded=expanded):
+            folder_key = self._folder_checkbox_key(parent_key, node.name)
+            current_path = f"{parent_key}/{node.name}" if parent_key else node.name
+
+            # Ensure folder checkbox state is initialised prior to widget
+            # creation to avoid Streamlit's post-instantiation mutation error.
+            if folder_key not in self._checkbox_states:
+                self._checkbox_states[folder_key] = st.session_state.get(folder_key, False)
+
+            if folder_key not in st.session_state:
+                st.session_state[folder_key] = self._checkbox_states[folder_key]
+
+            if parent_selected and not st.session_state[folder_key]:
+                st.session_state[folder_key] = True
+
+            folder_selected = container.checkbox("Select all", key=folder_key)
+
+            previous_state = self._checkbox_states.get(folder_key, False)
+            if folder_selected != previous_state:
+                self._checkbox_states[folder_key] = folder_selected
+                self._set_files_under_node(node, folder_selected, current_path)
+            else:
+                self._checkbox_states.setdefault(folder_key, folder_selected)
+
+            for child in node.iter_children_sorted():
+                if not self._node_matches_search(child, search_query):
+                    continue
+                self._render_node(
+                    child,
+                    level=level + 1,
+                    parent_key=f"{parent_key}/{node.name}" if parent_key else node.name,
+                    parent_selected=parent_selected or folder_selected,
+                    search_query=search_query,
+                    container=container,
+                )
+
+    # ------------------------------------------------------------------
     # Main Renderer
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def render(self, container=None) -> List[str]:
         """Render the entire tree and return selected file paths."""
         if container is None:
             container = st
 
+        # Rebuild selected files from widget state so deselections propagate.
+        self.selected_files = {
+            key.split("::", 1)[1]
+            for key, value in st.session_state.items()
+            if key.startswith("file::") and value
+        }
+
         # Search bar
         search_query = container.text_input("🔎 Search files", "").strip().lower()
+
+        # Global select all toggle
+        global_key = "global::select_all"
+        previous_global = self._checkbox_states.get(global_key, False)
+        global_selected = container.checkbox("Select all files", key=global_key, value=previous_global)
+        if global_selected != previous_global:
+            self._checkbox_states[global_key] = global_selected
+            for root in self.tree.values():
+                root_folder_key = self._folder_checkbox_key("root", root.name)
+                st.session_state[root_folder_key] = global_selected
+                self._checkbox_states[root_folder_key] = global_selected
+                self._set_files_under_node(root, global_selected, "root")
+        else:
+            self._checkbox_states.setdefault(global_key, global_selected)
 
         # Sort so 'Other Files' is last
         root_names = sorted(self.tree.keys(), key=lambda x: (x == "Other Files", x.lower()))
         for root_name in root_names:
             root = self.tree[root_name]
-            if search_query and not self._node_matches_search(root, search_query):
+            if not self._node_matches_search(root, search_query):
                 continue
             self._render_node(
                 root,
                 level=0,
                 parent_key="root",
-                parent_selected=now_global,
-                container=container)
+                parent_selected=global_selected,
+                search_query=search_query,
+                container=container,
+            )
 
         container.caption(f"**{len(self.selected_files)}** files selected")
-        return list(self.selected_files)
+        return sorted(self.selected_files)

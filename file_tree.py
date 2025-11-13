@@ -1,19 +1,38 @@
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 import streamlit as st
 
 
 class FileNode:
     """Represents a node in the file tree (folder or file)."""
-    def __init__(self, name: str, is_file: bool = False, file_path: Optional[str] = None):
+
+    def __init__(
+        self,
+        name: str,
+        is_file: bool = False,
+        file_path: Optional[str] = None,
+        path: Optional[Tuple[str, ...]] = None,
+    ):
         self.name = name
         self.is_file = is_file
         self.file_path = file_path
+        # Tuple representing the node's location from the tree root
+        self.path: Tuple[str, ...] = path or (name,)
         self.children: Dict[str, "FileNode"] = {}
 
-    def add_child(self, name: str, is_file: bool = False, file_path: Optional[str] = None) -> "FileNode":
+    def add_child(
+        self, name: str, is_file: bool = False, file_path: Optional[str] = None
+    ) -> "FileNode":
         """Add or get a child node."""
+        child_path = (*self.path, name)
         if name not in self.children:
-            self.children[name] = FileNode(name, is_file, file_path)
+            self.children[name] = FileNode(name, is_file, file_path, child_path)
+        else:
+            child = self.children[name]
+            # Ensure existing nodes keep the most up to date metadata
+            if is_file:
+                child.is_file = True
+                child.file_path = file_path
+            child.path = child_path
         return self.children[name]
 
 
@@ -38,7 +57,7 @@ class FileTreeSelector:
 
             root_name = parts[0]
             if root_name not in roots:
-                roots[root_name] = FileNode(root_name)
+                roots[root_name] = FileNode(root_name, path=(root_name,))
 
             current = roots[root_name]
             for part in parts[1:-1]:
@@ -48,27 +67,28 @@ class FileTreeSelector:
         return roots
 
     # --------------------------------------------------------------------------
-    # Recursive search
-    def _filter_tree(self, node: FileNode, query: str) -> Optional[FileNode]:
-        """Return filtered copy of node that matches query or has matching descendants."""
+    # Recursive search helpers
+    def _collect_matches(
+        self, node: FileNode, query: str, matches: Set[Tuple[str, ...]]
+    ) -> bool:
+        """Collect node paths that should remain visible during a search."""
+
         if not query:
-            return node
+            return True
 
         clean_query = query.lower()
         match_self = clean_query in node.name.lower()
 
-        filtered_children = {}
-        for child_name, child in node.children.items():
-            filtered_child = self._filter_tree(child, query)
-            if filtered_child:
-                filtered_children[child_name] = filtered_child
+        descendant_match = False
+        for child in node.children.values():
+            if self._collect_matches(child, query, matches):
+                descendant_match = True
 
-        if match_self or filtered_children:
-            new_node = FileNode(node.name, node.is_file, node.file_path)
-            new_node.children = filtered_children
-            return new_node
+        if match_self or descendant_match:
+            matches.add(node.path)
+            return True
 
-        return None
+        return False
 
     def _get_all_files(self, node: FileNode) -> Set[str]:
         """Recursively collect all file paths under a node."""
@@ -81,38 +101,72 @@ class FileTreeSelector:
 
     # --------------------------------------------------------------------------
     # Recursive renderer
-    def _render_node(self, node: FileNode, level: int = 0, parent_selected: bool = False):
+    def _render_node(
+        self,
+        node: FileNode,
+        level: int = 0,
+        parent_selected: bool = False,
+        search_active: bool = False,
+        matches: Optional[Set[Tuple[str, ...]]] = None,
+    ):
         """Render each folder/file recursively with checkboxes."""
         indent = " " * level  # Unicode em space for hierarchy indentation
 
+        node_key = "/".join(node.path)
+
+        if search_active and matches is not None and node.path not in matches:
+            return
+
         if node.is_file:
             checked = node.file_path in self.selected_files or parent_selected
-            if st.checkbox(f"{indent}📄 {node.name}", value=checked, key=node.file_path):
+            if st.checkbox(
+                f"{indent}📄 {node.name}", value=checked, key=node.file_path
+            ):
                 self.selected_files.add(node.file_path)
             else:
                 self.selected_files.discard(node.file_path)
         else:
             # Folder expander with “Select all in folder”
-            with st.expander(f"{indent}📁 {node.name}", expanded=False):
+            expanded = parent_selected or (
+                search_active and matches is not None and node.path in matches
+            )
+            with st.expander(f"{indent}📁 {node.name}", expanded=expanded):
                 folder_files = self._get_all_files(node)
                 folder_selected = all(f in self.selected_files for f in folder_files)
 
-                # Use callback-safe checkbox
-                def toggle_folder():
-                    if st.session_state[f"{node.name}_select_all"]:
+                select_all_key = f"fts_select::{node_key}"
+                prev_state = st.session_state.get(select_all_key, folder_selected)
+                checkbox_value = st.checkbox(
+                    f"Select all in '{node.name}'",
+                    value=folder_selected,
+                    key=select_all_key,
+                )
+
+                if checkbox_value != prev_state:
+                    # User toggled the checkbox during this run
+                    if checkbox_value:
                         self.selected_files.update(folder_files)
                     else:
                         self.selected_files.difference_update(folder_files)
+                    folder_selected = checkbox_value
+                else:
+                    # Keep UI in sync with the actual selection state
+                    if folder_selected != checkbox_value:
+                        st.session_state[select_all_key] = folder_selected
+                        checkbox_value = folder_selected
 
-                st.checkbox(
-                    "Select all in folder",
-                    key=f"{node.name}_select_all",
-                    value=folder_selected,
-                    on_change=toggle_folder,
-                )
+                children = sorted(node.children.values(), key=lambda n: n.name.lower())
+                if search_active and matches is not None:
+                    children = [child for child in children if child.path in matches]
 
-                for child in sorted(node.children.values(), key=lambda n: n.name.lower()):
-                    self._render_node(child, level + 1, parent_selected=folder_selected)
+                for child in children:
+                    self._render_node(
+                        child,
+                        level + 1,
+                        parent_selected=folder_selected,
+                        search_active=search_active,
+                        matches=matches,
+                    )
 
     # --------------------------------------------------------------------------
     def render(self, container: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
@@ -157,11 +211,22 @@ class FileTreeSelector:
                 on_change=toggle_all,
             )
 
-            # Render filtered tree
-            for root_name, root_node in sorted(self.tree.items()):
-                filtered_node = self._filter_tree(root_node, search_query)
-                if filtered_node:
-                    self._render_node(filtered_node, level=0)
+        # Determine nodes to keep visible when searching
+        matches: Optional[Set[Tuple[str, ...]]] = None
+        if search_query:
+            matches = set()
+            for root_node in self.tree.values():
+                self._collect_matches(root_node, search_query, matches)
+
+        # Render tree honoring search matches
+        for root_name, root_node in sorted(self.tree.items()):
+            self._render_node(
+                root_node,
+                level=0,
+                parent_selected=False,
+                search_active=bool(search_query),
+                matches=matches,
+            )
 
             container.caption(f"**{len(self.selected_files)}** files selected")
 

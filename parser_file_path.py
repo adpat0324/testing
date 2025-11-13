@@ -19,3 +19,10 @@ def _extract_metadata(self, f) -> dict:
             self.logger.warning(f"Failed to extract SharePoint metadata for {f}: {e}")
 
     return meta
+
+
+meta = self._extract_metadata(f)
+doc = LlamaIndexDocument(text=file_text, metadata=meta)
+self.logger.info(
+    f"Parsed {f.name} | site={meta.get('sitePath')} | drive={meta.get('driveName')} | parent={meta.get('parentPath')}"
+)

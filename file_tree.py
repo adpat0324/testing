@@ -167,7 +167,6 @@ class FileTreeSelector:
         node: FileNode,
         level: int = 0,
         parent_key: str = "",
-        parent_selected: bool = False,
         search_query: str = "",
         container=None,
     ) -> None:
@@ -177,10 +176,6 @@ class FileTreeSelector:
 
         if node.is_file and node.file_path:
             key = self._file_checkbox_key(node.file_path)
-            if parent_selected:
-                st.session_state[key] = True
-                self.selected_files.add(node.file_path)
-
             checked = container.checkbox(
                 node.name,
                 value=st.session_state.get(key, node.file_path in self.selected_files),
@@ -209,9 +204,6 @@ class FileTreeSelector:
             if folder_key not in st.session_state:
                 st.session_state[folder_key] = self._checkbox_states[folder_key]
 
-            if parent_selected and not st.session_state[folder_key]:
-                st.session_state[folder_key] = True
-
             folder_selected = container.checkbox("Select all", key=folder_key)
 
             previous_state = self._checkbox_states.get(folder_key, False)
@@ -228,7 +220,6 @@ class FileTreeSelector:
                     child,
                     level=level + 1,
                     parent_key=f"{parent_key}/{node.name}" if parent_key else node.name,
-                    parent_selected=parent_selected or folder_selected,
                     search_query=search_query,
                     container=container,
                 )
@@ -275,7 +266,6 @@ class FileTreeSelector:
                 root,
                 level=0,
                 parent_key="root",
-                parent_selected=global_selected,
                 search_query=search_query,
                 container=container,
             )

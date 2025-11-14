@@ -55,15 +55,20 @@ class FileTreeSelector:
                     self.selected_files.add(node.file_path)
                 else:
                     self.selected_files.discard(node.file_path)
+            return  # Important: return here for file nodes
         
+        # For folder nodes, recursively process all children
         for child in node.children.values():
             child_parent_key = f"{parent_key}/{node.name}" if parent_key else node.name
+            
             if not child.is_file:
-                # Only update folder checkbox if any child matches search
+                # Update the child folder's "Select all" checkbox state
                 if self._node_matches_search(child, search_query):
                     child_folder_key = self._folder_checkbox_key(child_parent_key, child.name)
                     st.session_state[child_folder_key] = value
                     self._checkbox_states[child_folder_key] = value
+            
+            # Recursively process this child (whether it's a file or folder)
             self._set_files_under_node(child, value, child_parent_key, search_query)
     
     def _folder_checkbox_callback(self, node: FileNode, folder_key: str, current_path: str, search_query: str):

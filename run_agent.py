@@ -1,41 +1,49 @@
-async def process_agent(user_q):
-    # Create a live placeholder for dynamic updates
-    status_placeholder = st.empty()
+import streamlit as st
+import asyncio
+import time
 
-    # Display initial spinner text
-    with status_placeholder.container():
-        st.info("💭 Thinking...")
+async def process_agent(user_q):
+    # Use a persistent placeholder that can re-render
+    spinner_placeholder = st.empty()
+    spinner = spinner_placeholder.container()
+
+    # Initial spinner
+    spinner.markdown("💭 *Thinking...*")
+
+    # Track timing for dynamic progress
+    last_update_time = time.time()
 
     async for update in st.session_state.agent.run_agent(user_q):
+
+        # === TOOL CALL PHASE ===
         if update["status"] == "tool_call":
-            # Update spinner text dynamically
-            status_placeholder.info(f"⚙️ Using tool **{update['tool_name']}**...")
+            # Replace spinner text only if >0.5s since last update to avoid flicker
+            if time.time() - last_update_time > 0.5:
+                spinner_placeholder.empty()
+                spinner = spinner_placeholder.container()
+                spinner.markdown(f"⚙️ *Using tool:* `{update['tool_name']}` ...")
+            last_update_time = time.time()
+
+        # === DONE PHASE ===
         elif update["status"] == "done":
-            # Clear the spinner and return the answer
-            status_placeholder.empty()
+            # Replace spinner text with success message
+            spinner_placeholder.empty()
+            spinner = spinner_placeholder.container()
+            spinner.markdown("✅ *Done!*")
+            await asyncio.sleep(0.5)  # small grace period so user sees completion
+            spinner_placeholder.empty()
             return update["answer"]
 
-    # Cleanup if something breaks
-    status_placeholder.empty()
+        # Optional: handle other statuses
+        else:
+            # Keep spinner alive during in-between messages
+            if time.time() - last_update_time > 0.5:
+                spinner.markdown("💭 *Still thinking...*")
+            last_update_time = time.time()
+
+    # Cleanup
+    spinner_placeholder.empty()
     return None
-
-
-
-chat_input
-
-if user_q:
-    message = ChatMessage(role="user", content=user_q, id=str(uuid4()))
-    st.session_state.messages.append(message)
-    st.session_state.memory_handler.save(message)
-    display_message(message)
-
-    # Dynamic spinner now handled in process_agent
-    answer = asyncio.run(process_agent(user_q))
-
-    message = ChatMessage(role="assistant", content=str(answer), id=str(uuid4()))
-    st.session_state.messages.append(message)
-    st.session_state.memory_handler.save(message)
-    display_message(message)
 
 
 status_placeholder.info(f"⚙️ Using tool **{update['tool_name']}**... please wait")

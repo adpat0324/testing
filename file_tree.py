@@ -144,8 +144,16 @@ class FileTreeSelector:
         """Set all descendant nodes to the provided boolean value."""
         if node.is_file and node.file_path:
             key = self._file_checkbox_key(node.file_path)
-            st.session_state[key] = value
-            if value:
+        
+            # If a parent is selected, mark file as selected before rendering
+            if parent_selected and not st.session_state.get(key, False):
+                st.session_state[key] = True
+        
+            # ✅ Let Streamlit manage the value
+            checked = container.checkbox(node.name, key=key)
+        
+            # Sync with our selected set
+            if checked:
                 self.selected_files.add(node.file_path)
             else:
                 self.selected_files.discard(node.file_path)

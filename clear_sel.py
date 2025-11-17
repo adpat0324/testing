@@ -1,3 +1,23 @@
+def _clear_all_selections(self):
+    """Clear all selections globally."""
+    # Clear all file checkboxes
+    for key in list(st.session_state.keys()):
+        if key.startswith("file::"):
+            st.session_state[key] = False
+    
+    # Clear all folder checkboxes
+    for key in list(st.session_state.keys()):
+        if key.startswith("folder::"):
+            st.session_state[key] = False
+    
+    # Clear global checkbox
+    global_key = "global::select_all"
+    st.session_state[global_key] = False
+    
+    # Clear internal state
+    self.selected_files.clear()
+    self._checkbox_states.clear()
+
 def render(self, container=None) -> List[str]:
     """Render the entire tree and return selected file paths."""
     if container is None:
@@ -13,39 +33,26 @@ def render(self, container=None) -> List[str]:
     # Search bar
     search_query = container.text_input("🔎 Search files", "").strip().lower()
     
-    # Global select all toggle
-    global_key = "global::select_all"
-    previous_global = self._checkbox_states.get(global_key, False)
-    global_selected = container.checkbox("Select all files", key=global_key, value=previous_global)
-    if global_selected != previous_global:
-        self._checkbox_states[global_key] = global_selected
-        for root in self.tree.values():
-            root_folder_key = self._folder_checkbox_key("root", root.name)
-            st.session_state[root_folder_key] = global_selected
-            self._checkbox_states[root_folder_key] = global_selected
-            self._set_files_under_node(root, global_selected, "root", search_query)
+    # Global controls in columns
+    col1, col2 = container.columns([3, 1])
     
-    # Clear Selection button
-    if container.button("Clear Selection"):
-        # Clear all file checkboxes
-        for key in list(st.session_state.keys()):
-            if key.startswith("file::"):
-                st.session_state[key] = False
-        
-        # Clear all folder checkboxes
-        for key in list(st.session_state.keys()):
-            if key.startswith("folder::"):
-                st.session_state[key] = False
-        
-        # Clear global checkbox
-        st.session_state[global_key] = False
-        
-        # Clear internal state
-        self.selected_files.clear()
-        self._checkbox_states.clear()
-        
-        # Force rerun to update UI
-        st.rerun()
+    with col1:
+        # Global select all toggle
+        global_key = "global::select_all"
+        previous_global = self._checkbox_states.get(global_key, False)
+        global_selected = container.checkbox("Select all files", key=global_key, value=previous_global)
+        if global_selected != previous_global:
+            self._checkbox_states[global_key] = global_selected
+            for root in self.tree.values():
+                root_folder_key = self._folder_checkbox_key("root", root.name)
+                st.session_state[root_folder_key] = global_selected
+                self._checkbox_states[root_folder_key] = global_selected
+                self._set_files_under_node(root, global_selected, "root", search_query)
+    
+    with col2:
+        # Clear Selection button with callback
+        if container.button("Clear All", key="global_clear_button", type="secondary", on_click=self._clear_all_selections):
+            pass  # Callback handles everything
     
     # Sort so 'Other Files' is last
     root_names = sorted(self.tree.keys(), key=lambda x: (x == "Other Files", x.lower()))

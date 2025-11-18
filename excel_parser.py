@@ -69,3 +69,29 @@ class ExcelParser(BaseParser):
             chunk = df.iloc[start:start + max_rows]
             chunks.append(chunk.to_markdown(index=False))
         return chunks
+
+
+
+# Convert entire sheet to markdown
+markdown_table = df.to_markdown(index=False)
+
+# Store entire sheet as a single document (useful for summary queries)
+parsed_documents.append({
+    "content": {
+        "markdown_full": markdown_table,
+        "json": df.to_json(orient="records")
+    },
+    "metadata": metadata | {"type": "full_sheet"}
+})
+
+# Chunk for RAG vector DB ingestion
+chunks = self._chunk_dataframe(df, max_rows=30)
+for chunk in chunks:
+    parsed_documents.append({
+        "content": {
+            "markdown": chunk,
+            "json": chunk  # can also convert chunk to JSON
+        },
+        "metadata": metadata | {"type": "chunk"}
+    })
+

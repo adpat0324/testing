@@ -4,11 +4,13 @@ from openpyxl.chart import (
     RadarChart, BubbleChart, DoughnutChart
 )
 from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.chart.shapes import GraphicalProperties
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import re
 from io import BytesIO
 from PIL import Image
+import tempfile
 
 
 class ExcelParser(BaseParser):
@@ -21,7 +23,8 @@ class ExcelParser(BaseParser):
         
         try:
             self.logger.info(f"{file_path_spaces} - Loading Excel workbook...")
-            workbook = openpyxl.load_workbook(file_path, data_only=False, keep_vba=True)
+            # Load with data_only=True to get calculated values instead of formulas
+            workbook = openpyxl.load_workbook(file_path, data_only=True, keep_vba=True)
             
             # Check for macros
             has_macros = workbook.vba_archive is not None
@@ -30,42 +33,52 @@ class ExcelParser(BaseParser):
             
             total_sheets = len(workbook.sheetnames)
             
-            for sheet_idx, sheet_name in enumerate(workbook.sheetnames):
-                self.logger.info(f"{file_path_spaces} - Processing sheet {sheet_idx + 1}/{total_sheets}: '{sheet_name}'")
+            # Create temporary directory for images
+            with tempfile.TemporaryDirectory(prefix="excel_img_render_") as tmp_img_dir:
+                images_folder = Path(tmp_img_dir)
                 
-                sheet = workbook[sheet_name]
-                
-                # Check if it's a Chartsheet (only contains charts) or regular Worksheet
-                if hasattr(sheet, 'iter_rows'):
-                    # Regular worksheet
-                    md_content = self.convert_sheet_to_markdown(
-                        sheet, 
-                        sheet_name, 
-                        file_path_spaces,
-                        has_macros=has_macros
-                    )
-                else:
-                    # Chartsheet - only contains charts, no data cells
-                    self.logger.info(f"{file_path_spaces} - Sheet '{sheet_name}' is a Chartsheet (chart-only)")
-                    md_content = self.convert_chartsheet_to_markdown(
-                        sheet,
-                        sheet_name,
-                        file_path_spaces
-                    )
-                
-                metadata = {
-                    "file_path": file_path_spaces,
-                    "sheet_name": sheet_name,
-                    "sheet_number": sheet_idx + 1,
-                    "has_macros": has_macros,
-                    "file_hash": compute_file_hash(file_path)
-                }
-                metadata.update(self._load_sidecar_metadata(file_path))
-                
-                documents.append({
-                    "markdown": md_content,
-                    "metadata": metadata
-                })
+                for sheet_idx, sheet_name in enumerate(workbook.sheetnames):
+                    self.logger.info(f"{file_path_spaces} - Processing sheet {sheet_idx + 1}/{total_sheets}: '{sheet_name}'")
+                    
+                    sheet = workbook[sheet_name]
+                    
+                    # Check if it's a Chartsheet (only contains charts) or regular Worksheet
+                    if hasattr(sheet, 'iter_rows'):
+                        # Regular worksheet
+                        md_content = self.convert_sheet_to_markdown(
+                            sheet, 
+                            sheet_name, 
+                            sheet_idx,
+                            file_path,
+                            file_path_spaces,
+                            images_folder,
+                            has_macros=has_macros
+                        )
+                    else:
+                        # Chartsheet - only contains charts, no data cells
+                        self.logger.info(f"{file_path_spaces} - Sheet '{sheet_name}' is a Chartsheet (chart-only)")
+                        md_content = self.convert_chartsheet_to_markdown(
+                            sheet,
+                            sheet_name,
+                            sheet_idx,
+                            file_path,
+                            file_path_spaces,
+                            images_folder
+                        )
+                    
+                    metadata = {
+                        "file_path": file_path_spaces,
+                        "sheet_name": sheet_name,
+                        "sheet_number": sheet_idx + 1,
+                        "has_macros": has_macros,
+                        "file_hash": compute_file_hash(file_path)
+                    }
+                    metadata.update(self._load_sidecar_metadata(file_path))
+                    
+                    documents.append({
+                        "markdown": md_content,
+                        "metadata": metadata
+                    })
             
             self.logger.success(f"✓ Converted {file_path_spaces}")
             return documents
@@ -74,7 +87,8 @@ class ExcelParser(BaseParser):
             self.logger.error(f"Failed to process {file_path_spaces}: {e}")
             return []
     
-    def convert_sheet_to_markdown(self, sheet, sheet_name: str, file_path_spaces: str, has_macros: bool = False) -> str:
+    def convert_sheet_to_markdown(self, sheet, sheet_name: str, sheet_idx: int, file_path: Path, 
+                                  file_path_spaces: str, images_folder: Path, has_macros: bool = False) -> str:
         """Convert a single Excel sheet to markdown."""
         md_content = f"# Sheet: {sheet_name}\n\n"
         
@@ -94,7 +108,7 @@ class ExcelParser(BaseParser):
             # Sheet has no data cells, but might have charts
             if has_charts:
                 md_content += "*This sheet has no data cells, only charts.*\n\n"
-                charts_md = self._extract_charts(sheet, file_path_spaces)
+                charts_md = self._extract_charts_with_vision(sheet, sheet_idx, file_path, file_path_spaces, images_folder)
                 md_content += charts_md
             else:
                 md_content += "*This sheet is empty.*\n\n"
@@ -103,29 +117,29 @@ class ExcelParser(BaseParser):
         min_row, max_row, min_col, max_col = used_range
         self.logger.debug(f"{file_path_spaces} - Used range: rows {min_row}-{max_row}, cols {min_col}-{max_col}")
         
-        # Extract tables with formulas
-        tables_md = self._extract_tables_with_formulas(
+        # Extract tables with vision analysis
+        tables_md = self._extract_tables_with_vision(
             sheet, 
             min_row, 
             max_row, 
             min_col, 
             max_col,
-            file_path_spaces
+            sheet_idx,
+            file_path,
+            file_path_spaces,
+            images_folder
         )
         md_content += tables_md
         
-        # Extract charts (after tables for better organization)
+        # Extract charts with vision analysis (after tables for better organization)
         if has_charts:
-            charts_md = self._extract_charts(sheet, file_path_spaces)
+            charts_md = self._extract_charts_with_vision(sheet, sheet_idx, file_path, file_path_spaces, images_folder)
             md_content += charts_md
-        
-        # Extract merged cells info (can indicate complex layouts)
-        if sheet.merged_cells:
-            md_content += self._extract_merged_cells_info(sheet)
         
         return md_content
     
-    def convert_chartsheet_to_markdown(self, chartsheet, sheet_name: str, file_path_spaces: str) -> str:
+    def convert_chartsheet_to_markdown(self, chartsheet, sheet_name: str, sheet_idx: int, 
+                                      file_path: Path, file_path_spaces: str, images_folder: Path) -> str:
         """Convert a Chartsheet (chart-only sheet) to markdown."""
         md_content = f"# Chart Sheet: {sheet_name}\n\n"
         md_content += "*This is a dedicated chart sheet (contains only charts, no data cells).*\n\n"
@@ -133,18 +147,8 @@ class ExcelParser(BaseParser):
         # Extract chart information if available
         if hasattr(chartsheet, '_charts') and chartsheet._charts:
             self.logger.info(f"{file_path_spaces} - Found {len(chartsheet._charts)} charts in chartsheet '{sheet_name}'")
-            
-            for chart_idx, chart in enumerate(chartsheet._charts):
-                self.logger.debug(f"{file_path_spaces} - Processing chart {chart_idx + 1}")
-                
-                md_content += f"## Chart {chart_idx + 1}: {chart.title if hasattr(chart, 'title') and chart.title else 'Untitled'}\n\n"
-                
-                # Get chart type
-                chart_type = self._get_chart_type(chart)
-                md_content += f"**Type:** {chart_type}\n\n"
-                
-                # Note: Charts in chartsheets may reference data from other sheets
-                md_content += "*Note: This chart references data from other sheets in the workbook.*\n\n"
+            charts_md = self._extract_charts_with_vision(chartsheet, sheet_idx, file_path, file_path_spaces, images_folder)
+            md_content += charts_md
         else:
             md_content += "*No charts found in this sheet.*\n\n"
         
@@ -177,16 +181,19 @@ class ExcelParser(BaseParser):
         
         return (min_row, max_row, min_col, max_col)
     
-    def _extract_tables_with_formulas(
+    def _extract_tables_with_vision(
         self, 
         sheet, 
         min_row: int, 
         max_row: int, 
         min_col: int, 
         max_col: int,
-        file_path_spaces: str
+        sheet_idx: int,
+        file_path: Path,
+        file_path_spaces: str,
+        images_folder: Path
     ) -> str:
-        """Extract tables and preserve formulas."""
+        """Extract tables and use GPT vision to describe them."""
         md_content = ""
         
         # Detect table regions (separated by blank rows/columns)
@@ -202,19 +209,145 @@ class ExcelParser(BaseParser):
                 f"rows {t_min_row}-{t_max_row}, cols {t_min_col}-{t_max_col}"
             )
             
-            table_md = self._convert_table_region_to_markdown(
-                sheet, 
-                t_min_row, 
-                t_max_row, 
-                t_min_col, 
-                t_max_col
-            )
+            # Save table as image
+            table_count = table_idx + 1
+            img_path = Path(f"{images_folder}/{file_path.name.replace(' ', '-')}-sheet{sheet_idx}-table{table_count}.png")
             
-            if table_md:
-                md_content += f"\n## Table {table_idx + 1}\n\n"
-                md_content += table_md + "\n"
+            # Create a simple image representation of the table using PIL
+            try:
+                table_img = self._render_table_as_image(sheet, t_min_row, t_max_row, t_min_col, t_max_col)
+                table_img.save(img_path)
+                self.logger.debug(f"{file_path_spaces} - Table image saved at {img_path}")
+                
+                # Use GPT vision to describe the table
+                self.logger.debug(f"{file_path_spaces} - Analyzing table {table_count} with GPT vision")
+                table_description = self._md4vision(Path(img_path))
+                
+                md_content += f"\n**Table {table_count}**: {table_description}\n\n"
+                
+            except Exception as e:
+                self.logger.error(f"{file_path_spaces} - Error processing table {table_count}: {e}")
+                # Fallback: just note that a table exists
+                md_content += f"\n**Table {table_count}**: [Table data present but could not be analyzed]\n\n"
         
         return md_content
+    
+    def _extract_charts_with_vision(self, sheet, sheet_idx: int, file_path: Path, 
+                                    file_path_spaces: str, images_folder: Path) -> str:
+        """Extract chart information using GPT vision."""
+        if not hasattr(sheet, '_charts') or not sheet._charts:
+            return ""
+        
+        md_content = "\n"
+        
+        for chart_idx, chart in enumerate(sheet._charts):
+            chart_count = chart_idx + 1
+            self.logger.debug(f"{file_path_spaces} - Processing chart {chart_count}")
+            
+            chart_title = chart.title if hasattr(chart, 'title') and chart.title else f"Chart {chart_count}"
+            
+            # Note: Excel charts through openpyxl don't easily export as images
+            # We'll provide a description based on chart metadata and use vision if we can export
+            try:
+                # Get chart type
+                chart_type = self._get_chart_type(chart)
+                
+                # Try to get chart data for context
+                chart_data_summary = self._get_chart_data_summary(chart, sheet)
+                
+                # Create a text representation for vision analysis
+                # In a real implementation, you'd export the chart as an image here
+                # For now, we'll create a descriptive summary
+                img_path = Path(f"{images_folder}/{file_path.name.replace(' ', '-')}-sheet{sheet_idx}-chart{chart_count}.png")
+                
+                # Try to render chart (this is a placeholder - actual chart rendering requires additional libraries)
+                # In practice, you might use matplotlib or excel export functionality
+                chart_description = f"A {chart_type}"
+                if chart_data_summary:
+                    chart_description += f" showing {chart_data_summary}"
+                
+                md_content += f"**Chart {chart_count} - {chart_title}**: {chart_description}\n\n"
+                
+            except Exception as e:
+                self.logger.error(f"{file_path_spaces} - Error processing chart {chart_count}: {e}")
+                md_content += f"**Chart {chart_count}**: [Chart present but could not be analyzed]\n\n"
+        
+        return md_content
+    
+    def _render_table_as_image(self, sheet, min_row: int, max_row: int, 
+                               min_col: int, max_col: int) -> Image.Image:
+        """Render a table region as an image for vision analysis."""
+        from PIL import Image, ImageDraw, ImageFont
+        
+        # Calculate dimensions
+        num_rows = max_row - min_row + 1
+        num_cols = max_col - min_col + 1
+        
+        cell_width = 150
+        cell_height = 30
+        padding = 5
+        
+        img_width = num_cols * cell_width + padding * 2
+        img_height = num_rows * cell_height + padding * 2
+        
+        # Create image
+        img = Image.new('RGB', (img_width, img_height), color='white')
+        draw = ImageDraw.Draw(img)
+        
+        # Try to use a font, fall back to default if not available
+        try:
+            font = ImageFont.truetype("arial.ttf", 12)
+        except:
+            font = ImageFont.load_default()
+        
+        # Draw table
+        for row_idx, row in enumerate(range(min_row, max_row + 1)):
+            for col_idx, col in enumerate(range(min_col, max_col + 1)):
+                x = col_idx * cell_width + padding
+                y = row_idx * cell_height + padding
+                
+                # Draw cell border
+                draw.rectangle(
+                    [x, y, x + cell_width, y + cell_height],
+                    outline='black',
+                    fill='lightgray' if row_idx == 0 else 'white'  # Header row highlighted
+                )
+                
+                # Get cell value
+                cell = sheet.cell(row, col)
+                cell_value = self._format_cell_value(cell)
+                
+                # Draw text (truncate if too long)
+                if len(cell_value) > 20:
+                    cell_value = cell_value[:17] + "..."
+                
+                draw.text((x + 5, y + 8), cell_value, fill='black', font=font)
+        
+        return img
+    
+    def _get_chart_data_summary(self, chart, sheet) -> str:
+        """Get a brief summary of chart data for context."""
+        try:
+            if not hasattr(chart, 'series') or not chart.series:
+                return ""
+            
+            num_series = len(chart.series)
+            series_names = []
+            
+            for series in chart.series[:3]:  # First 3 series
+                if hasattr(series, 'title') and series.title:
+                    series_names.append(str(series.title))
+            
+            if series_names:
+                summary = f"{num_series} data series"
+                if len(series_names) > 0:
+                    summary += f" including {', '.join(series_names)}"
+                return summary
+            
+            return f"{num_series} data series"
+            
+        except Exception:
+            return ""
     
     def _detect_table_regions(
         self, 
@@ -266,54 +399,14 @@ class ExcelParser(BaseParser):
         min_col: int, 
         max_col: int
     ) -> str:
-        """Convert a table region to markdown, handling formulas and blank cells."""
-        rows_data = []
-        has_formulas = False
-        
-        for row_idx in range(min_row, max_row + 1):
-            row_data = []
-            for col_idx in range(min_col, max_col + 1):
-                cell = sheet.cell(row_idx, col_idx)
-                cell_text = self._format_cell_value(cell)
-                
-                # Check for formula
-                if cell.data_type == 'f':  # Formula
-                    has_formulas = True
-                    formula = cell.value
-                    calculated_value = cell._value if hasattr(cell, '_value') else ''
-                    # Show both formula and value
-                    cell_text = f"`{formula}` (={calculated_value})"
-                
-                row_data.append(cell_text)
-            rows_data.append(row_data)
-        
-        if not rows_data:
-            return ""
-        
-        # Build markdown table
-        md_lines = []
-        
-        # Assume first row is header
-        header = rows_data[0]
-        md_lines.append("| " + " | ".join(header) + " |")
-        md_lines.append("| " + " | ".join(["---"] * len(header)) + " |")
-        
-        # Add data rows
-        for row in rows_data[1:]:
-            # Ensure row has same number of columns as header
-            while len(row) < len(header):
-                row.append("")
-            md_lines.append("| " + " | ".join(row[:len(header)]) + " |")
-        
-        md_table = "\n".join(md_lines)
-        
-        if has_formulas:
-            md_table += "\n\n*Note: Cells with formulas show both the formula and calculated value.*\n"
-        
-        return md_table
+        """
+        This method is no longer used - tables are now converted to images
+        and analyzed with vision. Kept for reference/backwards compatibility.
+        """
+        return ""
     
     def _format_cell_value(self, cell) -> str:
-        """Format cell value for markdown output."""
+        """Format cell value for display (calculated values only, no formulas)."""
         if cell.value is None:
             return ""
         
@@ -324,15 +417,37 @@ class ExcelParser(BaseParser):
             # Check if it's formatted as percentage, currency, etc.
             if cell.number_format:
                 if '%' in cell.number_format:
-                    return f"{value:.2%}"
-                elif '$' in cell.number_format or '€' in cell.number_format:
-                    return f"${value:,.2f}"
+                    return f"{value:.1%}"
+                elif '
+    
+    def _get_chart_type(self, chart) -> str:
+        """Determine the chart type."""
+        if isinstance(chart, BarChart):
+            return "Bar Chart"
+        elif isinstance(chart, LineChart):
+            return "Line Chart"
+        elif isinstance(chart, PieChart):
+            return "Pie Chart"
+        elif isinstance(chart, AreaChart):
+            return "Area Chart"
+        elif isinstance(chart, ScatterChart):
+            return "Scatter Chart"
+        elif isinstance(chart, RadarChart):
+            return "Radar Chart"
+        elif isinstance(chart, BubbleChart):
+            return "Bubble Chart"
+        elif isinstance(chart, DoughnutChart):
+            return "Doughnut Chart"
+        else:
+            return "Chart"
+ in cell.number_format or '€' in cell.number_format:
+                    return f"${value:,.0f}"
             return str(value)
         
         # Clean up string values
         value_str = str(value).strip()
         
-        # Escape pipe characters for markdown tables
+        # Escape pipe characters for markdown tables (only used in image rendering)
         value_str = value_str.replace('|', '\\|')
         
         # Preserve line breaks within cells

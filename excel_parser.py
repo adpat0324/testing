@@ -23,42 +23,50 @@ class ExcelParser(BaseParser):
         documents: List[dict] = []
         file_hash = compute_file_hash(file_path)
 
-        for sheet_name in wb_values.sheetnames:
-            sheet_vals = wb_values[sheet_name]
-            sheet_formulas = wb_formulas[sheet_name]
 
-            metadata_base = {
-                "file_path": file_path,
-                "file_path_spaces": file_path_spaces,
-                "sheet_name": sheet_name,
-                "file_hash": file_hash,
-            }
-            metadata_base.update(self._load_sidecar_metadata(file_path))
+    from openpyxl.worksheet.worksheet import Worksheet
+    from openpyxl.worksheet.chartsheet import Chartsheet
 
-            # --------- main sheet as dataframe / table ----------
-            df = self._sheet_to_dataframe(sheet_vals)
-            if df is not None and not df.empty:
-                documents.extend(self._build_table_documents(df, metadata_base))
-
-            # formal Excel tables
-            documents.extend(self._build_excel_table_documents(sheet_vals, metadata_base))
-            # embedded images
-            documents.extend(self._build_image_documents(sheet_vals, metadata_base))
-            # embedded charts
-            documents.extend(self._build_chart_documents(sheet_vals, metadata_base))
-            # formulas (from formulas workbook)
-            documents.extend(self._build_formula_documents(sheet_formulas, metadata_base))
-
-        # macros live at workbook level, not per-sheet
-        metadata_workbook = {
+    for sheet_name in workbook.sheetnames:
+        sheet = workbook[sheet_name]
+    
+        metadata_base = {
             "file_path": file_path,
             "file_path_spaces": file_path_spaces,
-            "sheet_name": "(workbook)",
+            "sheet_name": sheet_name,
             "file_hash": file_hash,
         }
-        metadata_workbook.update(self._load_sidecar_metadata(file_path))
-        documents.extend(self._build_vba_documents(file_path, metadata_workbook))
+        metadata_base.update(self._load_sidecar_metadata(file_path))
+    
+        # ⚠️ STEP 1 — HANDLE CHARTSHEETS FIRST
+        if isinstance(sheet, Chartsheet):
+            self.logger.info(f"🟦 Sheet '{sheet_name}' is a ChartSheet — extracting charts only")
+            documents.extend(self._build_chart_documents(sheet, metadata_base))
+            continue  # important — prevents dataframe parsing!
+    
+        # ⚠️ STEP 2 — NORMAL WORKSHEETS ONLY
+        if isinstance(sheet, Worksheet):
+            df = self._sheet_to_dataframe(sheet)
+            if df is not None and not df.empty:
+                documents.extend(self._build_table_documents(df, metadata_base))
+    
+            documents.extend(self._build_excel_table_documents(sheet, metadata_base))
+            documents.extend(self._build_image_documents(sheet, metadata_base))
+            documents.extend(self._build_chart_documents(sheet, metadata_base))
+            # macros live at workbook level, not per-sheet
+            metadata_workbook = {
+                "file_path": file_path,
+                "file_path_spaces": file_path_spaces,
+                "sheet_name": "(workbook)",
+                "file_hash": file_hash,
+            }
+            metadata_workbook.update(self._load_sidecar_metadata(file_path))
+            documents.extend(self._build_vba_documents(file_path, metadata_workbook))
+    
+        else:
+            self.logger.info(f"⚠️ Unknown sheet type: {type(sheet)} — skipping structured parsing")
 
+        
         self.logger.info(f"✓ Parsed {file_path_spaces} with {len(documents)} fragments")
         return documents
 

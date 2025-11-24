@@ -34,12 +34,24 @@ class ExcelParser(BaseParser):
                 self.logger.info(f"{file_path_spaces} - Processing sheet {sheet_idx + 1}/{total_sheets}: '{sheet_name}'")
                 
                 sheet = workbook[sheet_name]
-                md_content = self.convert_sheet_to_markdown(
-                    sheet, 
-                    sheet_name, 
-                    file_path_spaces,
-                    has_macros=has_macros
-                )
+                
+                # Check if it's a Chartsheet (only contains charts) or regular Worksheet
+                if hasattr(sheet, 'iter_rows'):
+                    # Regular worksheet
+                    md_content = self.convert_sheet_to_markdown(
+                        sheet, 
+                        sheet_name, 
+                        file_path_spaces,
+                        has_macros=has_macros
+                    )
+                else:
+                    # Chartsheet - only contains charts, no data cells
+                    self.logger.info(f"{file_path_spaces} - Sheet '{sheet_name}' is a Chartsheet (chart-only)")
+                    md_content = self.convert_chartsheet_to_markdown(
+                        sheet,
+                        sheet_name,
+                        file_path_spaces
+                    )
                 
                 metadata = {
                     "file_path": file_path_spaces,
@@ -70,11 +82,22 @@ class ExcelParser(BaseParser):
         if has_macros:
             md_content += "⚠️ **Note:** This workbook contains VBA macros.\n\n"
         
+        # Check if sheet has charts first (before processing data)
+        has_charts = hasattr(sheet, '_charts') and sheet._charts
+        if has_charts:
+            self.logger.info(f"{file_path_spaces} - Found {len(sheet._charts)} charts in sheet '{sheet_name}'")
+        
         # Get the actual used range (excluding completely empty rows/columns)
         used_range = self._get_used_range(sheet)
         
         if not used_range:
-            md_content += "*This sheet is empty.*\n\n"
+            # Sheet has no data cells, but might have charts
+            if has_charts:
+                md_content += "*This sheet has no data cells, only charts.*\n\n"
+                charts_md = self._extract_charts(sheet, file_path_spaces)
+                md_content += charts_md
+            else:
+                md_content += "*This sheet is empty.*\n\n"
             return md_content
         
         min_row, max_row, min_col, max_col = used_range
@@ -91,15 +114,39 @@ class ExcelParser(BaseParser):
         )
         md_content += tables_md
         
-        # Extract charts
-        if hasattr(sheet, '_charts') and sheet._charts:
-            self.logger.info(f"{file_path_spaces} - Found {len(sheet._charts)} charts in sheet '{sheet_name}'")
+        # Extract charts (after tables for better organization)
+        if has_charts:
             charts_md = self._extract_charts(sheet, file_path_spaces)
             md_content += charts_md
         
         # Extract merged cells info (can indicate complex layouts)
         if sheet.merged_cells:
             md_content += self._extract_merged_cells_info(sheet)
+        
+        return md_content
+    
+    def convert_chartsheet_to_markdown(self, chartsheet, sheet_name: str, file_path_spaces: str) -> str:
+        """Convert a Chartsheet (chart-only sheet) to markdown."""
+        md_content = f"# Chart Sheet: {sheet_name}\n\n"
+        md_content += "*This is a dedicated chart sheet (contains only charts, no data cells).*\n\n"
+        
+        # Extract chart information if available
+        if hasattr(chartsheet, '_charts') and chartsheet._charts:
+            self.logger.info(f"{file_path_spaces} - Found {len(chartsheet._charts)} charts in chartsheet '{sheet_name}'")
+            
+            for chart_idx, chart in enumerate(chartsheet._charts):
+                self.logger.debug(f"{file_path_spaces} - Processing chart {chart_idx + 1}")
+                
+                md_content += f"## Chart {chart_idx + 1}: {chart.title if hasattr(chart, 'title') and chart.title else 'Untitled'}\n\n"
+                
+                # Get chart type
+                chart_type = self._get_chart_type(chart)
+                md_content += f"**Type:** {chart_type}\n\n"
+                
+                # Note: Charts in chartsheets may reference data from other sheets
+                md_content += "*Note: This chart references data from other sheets in the workbook.*\n\n"
+        else:
+            md_content += "*No charts found in this sheet.*\n\n"
         
         return md_content
     

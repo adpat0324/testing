@@ -1,16 +1,3 @@
-import tempfile
-from pathlib import Path
-from typing import List
-from io import BytesIO
-from PIL import Image
-import openpyxl
-from openpyxl.chart import (
-    BarChart, LineChart, PieChart, AreaChart, ScatterChart, 
-    BubbleChart, RadarChart, DoughnutChart
-)
-from openpyxl.utils import get_column_letter
-import pandas as pd
-
 
 class ExcelParser(BaseParser):
     def __init__(self) -> None:
@@ -62,6 +49,7 @@ class ExcelParser(BaseParser):
     def _extract_table_to_markdown(self, worksheet, start_row, start_col, end_row, end_col, file_path_spaces):
         """
         Extract a table region and convert to markdown.
+        Filters out empty rows/columns and 'Unnamed' columns.
         """
         self.logger.debug(f"{file_path_spaces} - Extracting table from cells "
                          f"{get_column_letter(start_col)}{start_row}:{get_column_letter(end_col)}{end_row}")
@@ -77,26 +65,83 @@ class ExcelParser(BaseParser):
                 # Get calculated value for formulas, not the formula itself
                 value = cell.value if cell.value is not None else ""
                 # Clean up the value
-                value = str(value).strip().replace("\n", " ")
+                value = str(value).strip().replace("\n", " ").replace("|", "\\|")  # Escape pipes
                 row_data.append(value)
-            rows_data.append(row_data)
+            
+            # Skip completely empty rows
+            if any(val for val in row_data):
+                rows_data.append(row_data)
+        
+        if not rows_data:
+            return ""
+        
+        # Check if first row is headers and filter out 'Unnamed' columns
+        header_row = rows_data[0]
+        valid_col_indices = []
+        filtered_headers = []
+        
+        for idx, header in enumerate(header_row):
+            # Keep column if it's not empty and doesn't start with 'Unnamed'
+            if header and not header.startswith('Unnamed'):
+                valid_col_indices.append(idx)
+                filtered_headers.append(header)
+            # Also keep columns that have data in rows below even if header is empty/unnamed
+            elif any(rows_data[row_idx][idx] for row_idx in range(1, len(rows_data)) if idx < len(rows_data[row_idx])):
+                valid_col_indices.append(idx)
+                filtered_headers.append(header if header else f"Column {idx+1}")
+        
+        # If no valid columns, return empty
+        if not valid_col_indices:
+            return ""
+        
+        # Filter all rows to only include valid columns
+        filtered_rows = []
+        for row in rows_data:
+            filtered_row = [row[idx] if idx < len(row) else "" for idx in valid_col_indices]
+            # Only include rows that have at least one non-empty value
+            if any(val for val in filtered_row):
+                filtered_rows.append(filtered_row)
         
         # Convert to markdown table
-        if rows_data:
+        if filtered_rows:
             # First row as header
-            md += "| " + " | ".join(rows_data[0]) + " |\n"
+            md += "| " + " | ".join(filtered_rows[0]) + " |\n"
             # Separator
-            md += "| " + " | ".join(["---"] * len(rows_data[0])) + " |\n"
-            # Data rows
-            for row in rows_data[1:]:
+            md += "| " + " | ".join(["---"] * len(filtered_rows[0])) + " |\n"
+            # Data rows (skip header)
+            for row in filtered_rows[1:]:
                 md += "| " + " | ".join(row) + " |\n"
             md += "\n"
         
         return md
     
-    def _convert_chart_to_markdown(self, chart, chart_count, worksheet, file_path_spaces):
+    def _save_chart_as_image(self, chart, chart_count, sheet_name, images_folder, file_path, file_path_spaces):
         """
-        Convert Excel chart to markdown representation with data table.
+        Export chart as an image file for vision processing.
+        Returns the path to the saved image or None if export fails.
+        """
+        try:
+            # Charts in openpyxl don't have a direct export method
+            # We need to extract the chart's graphical frame if available
+            # This is a limitation - openpyxl doesn't support chart export
+            
+            # Alternative: Check if chart has embedded image data
+            if hasattr(chart, '_chartSpace'):
+                # Some charts may have rendered images embedded
+                # This is highly version/format dependent
+                pass
+            
+            self.logger.debug(f"{file_path_spaces} - Chart image export not available via openpyxl")
+            return None
+            
+        except Exception as e:
+            self.logger.debug(f"{file_path_spaces} - Could not export chart as image: {e}")
+            return None
+    
+    def _convert_chart_to_markdown(self, chart, chart_count, worksheet, sheet_name, images_folder, file_path, file_path_spaces):
+        """
+        Convert Excel chart to markdown representation.
+        Attempts programmatic extraction, falls back to vision if chart image available.
         """
         self.logger.debug(f"{file_path_spaces} - Processing chart number {chart_count}")
         
@@ -106,10 +151,22 @@ class ExcelParser(BaseParser):
         chart_type = type(chart).__name__
         md_content += f"_Chart Type: {chart_type}_\n\n"
         
+        # Try to save chart as image for vision processing
+        chart_img_path = self._save_chart_as_image(chart, chart_count, sheet_name, images_folder, file_path, file_path_spaces)
+        
+        if chart_img_path:
+            # Use vision to interpret the chart
+            self.logger.debug(f"{file_path_spaces} - Using GPT vision to interpret chart {chart_count}")
+            md_content += self._gpt4o_vision(chart_img_path)
+            md_content += "\n\n"
+            return md_content
+        
+        # Fallback: Try programmatic extraction
         try:
             # Extract chart title if available
             if hasattr(chart, 'title') and chart.title:
-                md_content += f"**{chart.title.text.rich.text if hasattr(chart.title.text, 'rich') else chart.title}**\n\n"
+                title_text = chart.title.text.rich.text if hasattr(chart.title.text, 'rich') else str(chart.title)
+                md_content += f"**{title_text}**\n\n"
             
             markdown_chart_table = []
             
@@ -121,14 +178,15 @@ class ExcelParser(BaseParser):
                     if hasattr(series, 'cat') and series.cat:
                         categories = self._get_reference_values(series.cat, worksheet)
                     else:
-                        categories = [f"Category {i+1}" for i in range(len(series.val.numRef.numCache.pt) if hasattr(series.val, 'numRef') else 0)]
+                        categories = [f"Category {i+1}" for i in range(len(series.val.numRef.numCache.pt) if hasattr(series.val, 'numRef') and series.val.numRef and series.val.numRef.numCache else 0)]
                     
                     values = self._get_reference_values(series.val, worksheet)
                     
-                    markdown_chart_table.append("| Slice Label | Value |")
-                    markdown_chart_table.append("|---|---|")
-                    for label, value in zip(categories, values):
-                        markdown_chart_table.append(f"| {label} | {value} |")
+                    if categories and values and len(categories) == len(values):
+                        markdown_chart_table.append("| Slice Label | Value |")
+                        markdown_chart_table.append("|---|---|")
+                        for label, value in zip(categories, values):
+                            markdown_chart_table.append(f"| {label} | {value} |")
             
             # Handle Scatter/Bubble Charts
             elif isinstance(chart, (ScatterChart, BubbleChart)):
@@ -171,45 +229,65 @@ class ExcelParser(BaseParser):
                         all_series_values.append(values)
                     
                     # Create rows
-                    for idx in range(len(categories) if categories else (max(len(v) for v in all_series_values) if all_series_values else 0)):
-                        row = [categories[idx] if idx < len(categories) else f"Row {idx+1}"]
+                    max_len = len(categories) if categories else (max(len(v) for v in all_series_values) if all_series_values else 0)
+                    for idx in range(max_len):
+                        row = [str(categories[idx]) if idx < len(categories) else f"Row {idx+1}"]
                         for series_values in all_series_values:
-                            row.append(series_values[idx] if idx < len(series_values) else "")
-                        markdown_chart_table.append("| " + " | ".join(map(str, row)) + " |")
+                            row.append(str(series_values[idx]) if idx < len(series_values) else "")
+                        markdown_chart_table.append("| " + " | ".join(row) + " |")
             
             else:
-                markdown_chart_table.append(f"Unsupported chart type: {chart_type}")
+                markdown_chart_table.append(f"_Unsupported chart type for programmatic extraction_")
                 self.logger.debug(f"{file_path_spaces} - Unsupported chart type: {chart_type}")
             
             # Add chart markdown to content
             if markdown_chart_table:
                 md_content += "\n".join(markdown_chart_table) + "\n\n"
+            else:
+                md_content += "_Chart data could not be extracted_\n\n"
         
         except Exception as e:
-            self.logger.error(f"{file_path_spaces} - Error processing chart: {e}")
-            md_content += f"_Error extracting chart data: {e}_\n\n"
+            self.logger.error(f"{file_path_spaces} - Error processing chart {chart_count}: {e}")
+            md_content += f"_Error extracting chart data_\n\n"
         
         return md_content
     
     def _get_reference_values(self, reference, worksheet):
         """
         Extract values from a chart data reference.
+        Handles both cached values and direct cell references.
         """
         values = []
         try:
+            if reference is None:
+                return values
+            
+            # Try numeric reference with cache
             if hasattr(reference, 'numRef') and reference.numRef:
-                # Numeric reference
-                if hasattr(reference.numRef, 'numCache') and reference.numRef.numCache:
-                    values = [pt.v for pt in reference.numRef.numCache.pt]
-                elif hasattr(reference.numRef, 'f') and reference.numRef.f:
-                    # Parse the formula reference
+                if hasattr(reference.numRef, 'numCache') and reference.numRef.numCache and hasattr(reference.numRef.numCache, 'pt'):
+                    values = [pt.v for pt in reference.numRef.numCache.pt if pt and hasattr(pt, 'v')]
+                    if values:
+                        return values
+                
+                # Try formula reference if cache is empty
+                if hasattr(reference.numRef, 'f') and reference.numRef.f:
                     values = self._parse_formula_reference(reference.numRef.f, worksheet)
-            elif hasattr(reference, 'strRef') and reference.strRef:
-                # String reference
-                if hasattr(reference.strRef, 'strCache') and reference.strRef.strCache:
-                    values = [pt.v for pt in reference.strRef.strCache.pt]
-                elif hasattr(reference.strRef, 'f') and reference.strRef.f:
+                    if values:
+                        return values
+            
+            # Try string reference with cache
+            if hasattr(reference, 'strRef') and reference.strRef:
+                if hasattr(reference.strRef, 'strCache') and reference.strRef.strCache and hasattr(reference.strRef.strCache, 'pt'):
+                    values = [pt.v for pt in reference.strRef.strCache.pt if pt and hasattr(pt, 'v')]
+                    if values:
+                        return values
+                
+                # Try formula reference if cache is empty
+                if hasattr(reference.strRef, 'f') and reference.strRef.f:
                     values = self._parse_formula_reference(reference.strRef.f, worksheet)
+                    if values:
+                        return values
+            
         except Exception as e:
             self.logger.debug(f"Error getting reference values: {e}")
         
@@ -221,6 +299,9 @@ class ExcelParser(BaseParser):
         """
         values = []
         try:
+            if not formula:
+                return values
+            
             # Remove sheet name if present
             if '!' in formula:
                 formula = formula.split('!')[-1]
@@ -230,20 +311,32 @@ class ExcelParser(BaseParser):
             
             # Parse range
             if ':' in formula:
-                start, end = formula.split(':')
-                # This is a simplified parser - for production use openpyxl's range parser
-                from openpyxl.utils import coordinate_to_tuple, column_index_from_string
+                from openpyxl.utils import coordinate_to_tuple
                 
+                parts = formula.split(':')
+                if len(parts) != 2:
+                    return values
+                
+                start, end = parts
                 start_row, start_col = coordinate_to_tuple(start)
                 end_row, end_col = coordinate_to_tuple(end)
                 
+                # Read values from cells
                 for row in range(start_row, end_row + 1):
                     for col in range(start_col, end_col + 1):
                         cell_value = worksheet.cell(row, col).value
                         if cell_value is not None:
                             values.append(cell_value)
+            else:
+                # Single cell reference
+                from openpyxl.utils import coordinate_to_tuple
+                row, col = coordinate_to_tuple(formula)
+                cell_value = worksheet.cell(row, col).value
+                if cell_value is not None:
+                    values.append(cell_value)
+                    
         except Exception as e:
-            self.logger.debug(f"Error parsing formula reference: {e}")
+            self.logger.debug(f"Error parsing formula reference '{formula}': {e}")
         
         return values
     
@@ -280,13 +373,29 @@ class ExcelParser(BaseParser):
                     
                     # Add to markdown
                     md_content += f"**Figure {figure_count}**\n"
-                    md_content += self._md4vision(img_path)
+                    self.logger.debug(f"{file_path_spaces} - Replacing image with markdown using GPT vision")
+                    md_content += self._gpt4o_vision(img_path)
                     md_content += "\n\n"
                 
                 except Exception as e:
                     self.logger.error(f"{file_path_spaces} - Error processing image {img_idx + 1}: {e}")
         
         return md_content
+    
+    def _capture_sheet_with_charts(self, worksheet, sheet_name, images_folder, file_path, file_path_spaces):
+        """
+        Alternative method: If charts exist but can't be extracted programmatically,
+        capture them as images and use vision to interpret them.
+        This requires additional libraries like xlwings or win32com (Windows only) or 
+        converting to PDF first. For now, this is a placeholder for the approach.
+        """
+        # NOTE: This would require external tools to render Excel to image
+        # Options include:
+        # 1. xlwings (Windows/Mac with Excel installed)
+        # 2. unoconv + LibreOffice
+        # 3. Excel to PDF then PDF to images
+        # For MVP, we'll rely on programmatic extraction
+        pass
     
     def _process_sheet(self, worksheet, sheet_name, images_folder, file_path, file_path_spaces):
         """
@@ -311,13 +420,32 @@ class ExcelParser(BaseParser):
             # If not a clear table, still output as table format
             md_content += self._extract_table_to_markdown(worksheet, min_row, min_col, max_row, max_col, file_path_spaces)
         
-        # Process charts
+        # Process charts - check multiple sources
+        chart_count = 0
+        
+        # Method 1: worksheet._charts (standard openpyxl)
         if hasattr(worksheet, '_charts') and worksheet._charts:
+            self.logger.info(f"{file_path_spaces} - Found {len(worksheet._charts)} chart(s) via _charts in sheet '{sheet_name}'")
             for chart_idx, chart in enumerate(worksheet._charts):
                 try:
-                    md_content += self._convert_chart_to_markdown(chart, chart_idx + 1, worksheet, file_path_spaces)
+                    chart_md = self._convert_chart_to_markdown(
+                        chart, chart_count + 1, worksheet, sheet_name, 
+                        images_folder, file_path, file_path_spaces
+                    )
+                    if chart_md:
+                        md_content += chart_md
+                        chart_count += 1
                 except Exception as e:
                     self.logger.error(f"{file_path_spaces} - Error processing chart {chart_idx + 1} in sheet '{sheet_name}': {e}")
+        
+        # Method 2: Check worksheet drawings for embedded charts
+        if hasattr(worksheet, '_drawing') and worksheet._drawing:
+            self.logger.debug(f"{file_path_spaces} - Checking drawings for charts in sheet '{sheet_name}'")
+            # Drawing objects can contain charts that aren't in _charts
+            # This is a workaround for charts that openpyxl doesn't fully parse
+        
+        if chart_count == 0:
+            self.logger.debug(f"{file_path_spaces} - No charts found via standard methods in sheet '{sheet_name}'")
         
         # Process images
         md_content += self._extract_images_to_markdown(worksheet, images_folder, file_path, sheet_name, file_path_spaces)
@@ -412,3 +540,5 @@ class ExcelParser(BaseParser):
             except Exception as e:
                 self.logger.error(f"Failed to process {file_path_spaces}: {e}")
                 return []
+
+        

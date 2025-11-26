@@ -5,11 +5,18 @@ from io import BytesIO
 from PIL import Image
 import openpyxl
 from openpyxl.chart import (
-    BarChart, LineChart, PieChart, AreaChart, ScatterChart, 
-    BubbleChart, RadarChart, DoughnutChart
+    BarChart, BarChart3D,
+    LineChart, LineChart3D,
+    PieChart, PieChart3D,
+    AreaChart, AreaChart3D,
+    ScatterChart,
+    BubbleChart,
+    RadarChart,
+    DoughnutChart,
+    StockChart,
+    SurfaceChart, SurfaceChart3D
 )
 from openpyxl.utils import get_column_letter
-import pandas as pd
 
 
 class ExcelParser(BaseParser):
@@ -128,183 +135,283 @@ class ExcelParser(BaseParser):
         
         return md
     
-    def _save_chart_as_image(self, chart, chart_count, sheet_name, images_folder, file_path, file_path_spaces):
-        """
-        Export chart as an image file for vision processing.
-        Returns the path to the saved image or None if export fails.
-        """
-        try:
-            # Charts in openpyxl don't have a direct export method
-            # We need to extract the chart's graphical frame if available
-            # This is a limitation - openpyxl doesn't support chart export
-            
-            # Alternative: Check if chart has embedded image data
-            if hasattr(chart, '_chartSpace'):
-                # Some charts may have rendered images embedded
-                # This is highly version/format dependent
-                pass
-            
-            self.logger.debug(f"{file_path_spaces} - Chart image export not available via openpyxl")
-            return None
-            
-        except Exception as e:
-            self.logger.debug(f"{file_path_spaces} - Could not export chart as image: {e}")
-            return None
-    
     def _convert_chart_to_markdown(self, chart, chart_count, worksheet, sheet_name, images_folder, file_path, file_path_spaces):
         """
         Convert Excel chart to markdown representation.
-        Attempts programmatic extraction, falls back to vision if chart image available.
+        Extracts data directly from chart series, similar to PowerPoint's approach.
         """
         self.logger.debug(f"{file_path_spaces} - Processing chart number {chart_count}")
         
         md_content = f"**Chart {chart_count}**\n"
         
-        # Determine chart type
+        # Determine chart type from class name
         chart_type = type(chart).__name__
         md_content += f"_Chart Type: {chart_type}_\n\n"
         
-        # Try to save chart as image for vision processing
-        chart_img_path = self._save_chart_as_image(chart, chart_count, sheet_name, images_folder, file_path, file_path_spaces)
-        
-        if chart_img_path:
-            # Use vision to interpret the chart
-            self.logger.debug(f"{file_path_spaces} - Using GPT vision to interpret chart {chart_count}")
-            md_content += self._gpt4o_vision(chart_img_path)
-            md_content += "\n\n"
-            return md_content
-        
-        # Fallback: Try programmatic extraction
         try:
             # Extract chart title if available
             if hasattr(chart, 'title') and chart.title:
-                title_text = chart.title.text.rich.text if hasattr(chart.title.text, 'rich') else str(chart.title)
-                md_content += f"**{title_text}**\n\n"
+                try:
+                    title_text = chart.title.value if hasattr(chart.title, 'value') else str(chart.title)
+                    if title_text and title_text.strip():
+                        md_content += f"**{title_text}**\n\n"
+                except:
+                    pass
+            
+            # Check if chart has any series
+            if not chart.series or len(chart.series) == 0:
+                self.logger.debug(f"{file_path_spaces} - Chart {chart_count} has no series data")
+                md_content += "_Chart has no data series_\n\n"
+                return md_content
             
             markdown_chart_table = []
             
-            # Handle Pie/Doughnut Charts
-            if isinstance(chart, (PieChart, DoughnutChart)):
-                if chart.series:
-                    series = chart.series[0]
-                    # Get categories and values
-                    if hasattr(series, 'cat') and series.cat:
-                        categories = self._get_reference_values(series.cat, worksheet)
-                    else:
-                        categories = [f"Category {i+1}" for i in range(len(series.val.numRef.numCache.pt) if hasattr(series.val, 'numRef') and series.val.numRef and series.val.numRef.numCache else 0)]
-                    
-                    values = self._get_reference_values(series.val, worksheet)
-                    
-                    if categories and values and len(categories) == len(values):
-                        markdown_chart_table.append("| Slice Label | Value |")
-                        markdown_chart_table.append("|---|---|")
-                        for label, value in zip(categories, values):
-                            markdown_chart_table.append(f"| {label} | {value} |")
+            # Handle Pie/Doughnut Charts (single series, categories vs values)
+            if isinstance(chart, (PieChart, PieChart3D, DoughnutChart)):
+                series = chart.series[0]
+                
+                # Get categories - try multiple methods
+                categories = self._extract_chart_categories(series, worksheet)
+                # Get values
+                values = self._extract_chart_values(series, worksheet)
+                
+                if not values:
+                    self.logger.debug(f"{file_path_spaces} - No values extracted for pie/doughnut chart")
+                    md_content += "_Unable to extract chart data_\n\n"
+                    return md_content
+                
+                # Ensure we have labels
+                if not categories:
+                    categories = [f"Slice {i+1}" for i in range(len(values))]
+                
+                # Build table
+                markdown_chart_table.append("| Slice Label | Value |")
+                markdown_chart_table.append("|---|---|")
+                for label, value in zip(categories, values):
+                    markdown_chart_table.append(f"| {label} | {value} |")
             
-            # Handle Scatter/Bubble Charts
+            # Handle Scatter/Bubble Charts (x/y coordinates)
             elif isinstance(chart, (ScatterChart, BubbleChart)):
-                markdown_chart_table.append("| Series | X Value | Y Value |" + (" Bubble Size |" if isinstance(chart, BubbleChart) else ""))
-                markdown_chart_table.append("|---|---|---|" + ("---|" if isinstance(chart, BubbleChart) else ""))
+                header = "| Series | X Value | Y Value |"
+                separator = "|---|---|---|"
+                
+                if isinstance(chart, BubbleChart):
+                    header += " Bubble Size |"
+                    separator += "---|"
+                
+                markdown_chart_table.append(header)
+                markdown_chart_table.append(separator)
                 
                 for series in chart.series:
-                    series_name = series.title.value if hasattr(series, 'title') and series.title else "Series"
-                    x_values = self._get_reference_values(series.xVal, worksheet) if hasattr(series, 'xVal') and series.xVal else []
-                    y_values = self._get_reference_values(series.yVal, worksheet) if hasattr(series, 'yVal') and series.yVal else []
+                    series_name = self._get_series_name(series)
+                    x_values = self._extract_chart_x_values(series, worksheet)
+                    y_values = self._extract_chart_y_values(series, worksheet)
                     
-                    if isinstance(chart, BubbleChart) and hasattr(series, 'bubbleSize') and series.bubbleSize:
-                        bubble_sizes = self._get_reference_values(series.bubbleSize, worksheet)
-                        for x, y, size in zip(x_values, y_values, bubble_sizes):
+                    if not x_values or not y_values:
+                        continue
+                    
+                    if isinstance(chart, BubbleChart):
+                        bubble_sizes = self._extract_chart_bubble_sizes(series, worksheet)
+                        for x, y, size in zip(x_values, y_values, bubble_sizes if bubble_sizes else [1]*len(x_values)):
                             markdown_chart_table.append(f"| {series_name} | {x} | {y} | {size} |")
                     else:
                         for x, y in zip(x_values, y_values):
                             markdown_chart_table.append(f"| {series_name} | {x} | {y} |")
             
-            # Handle Category-based Charts (Bar, Column, Line, Area, Radar)
-            elif isinstance(chart, (BarChart, LineChart, AreaChart, RadarChart)):
+            # Handle Category-based Charts (Bar, Column, Line, Area, Radar, Surface)
+            elif isinstance(chart, (BarChart, BarChart3D, LineChart, LineChart3D, 
+                                   AreaChart, AreaChart3D, RadarChart, 
+                                   SurfaceChart, SurfaceChart3D, StockChart)):
                 # Get categories from first series
-                if chart.series:
-                    first_series = chart.series[0]
-                    if hasattr(first_series, 'cat') and first_series.cat:
-                        categories = self._get_reference_values(first_series.cat, worksheet)
-                    else:
-                        categories = []
-                    
-                    # Create header
-                    header_row = ["Category"] + [s.title.value if hasattr(s, 'title') and s.title else f"Series {i+1}" 
-                                                  for i, s in enumerate(chart.series)]
-                    markdown_chart_table.append("| " + " | ".join(header_row) + " |")
-                    markdown_chart_table.append("| " + " | ".join(["---"] * len(header_row)) + " |")
-                    
-                    # Get all series values
-                    all_series_values = []
-                    for series in chart.series:
-                        values = self._get_reference_values(series.val, worksheet)
-                        all_series_values.append(values)
-                    
-                    # Create rows
-                    max_len = len(categories) if categories else (max(len(v) for v in all_series_values) if all_series_values else 0)
-                    for idx in range(max_len):
-                        row = [str(categories[idx]) if idx < len(categories) else f"Row {idx+1}"]
-                        for series_values in all_series_values:
-                            row.append(str(series_values[idx]) if idx < len(series_values) else "")
-                        markdown_chart_table.append("| " + " | ".join(row) + " |")
+                if not chart.series:
+                    md_content += "_Chart has no series_\n\n"
+                    return md_content
+                
+                first_series = chart.series[0]
+                categories = self._extract_chart_categories(first_series, worksheet)
+                
+                # Build header row with series names
+                series_names = [self._get_series_name(s) for s in chart.series]
+                header_row = ["Category"] + series_names
+                markdown_chart_table.append("| " + " | ".join(header_row) + " |")
+                markdown_chart_table.append("| " + " | ".join(["---"] * len(header_row)) + " |")
+                
+                # Extract values for all series
+                all_series_values = []
+                for series in chart.series:
+                    values = self._extract_chart_values(series, worksheet)
+                    all_series_values.append(values)
+                
+                # Determine row count
+                max_len = len(categories) if categories else max([len(v) for v in all_series_values if v], default=0)
+                
+                if max_len == 0:
+                    md_content += "_No data could be extracted from chart_\n\n"
+                    return md_content
+                
+                # Ensure categories list is correct length
+                if not categories:
+                    categories = [f"Row {i+1}" for i in range(max_len)]
+                elif len(categories) < max_len:
+                    categories.extend([f"Row {i+1}" for i in range(len(categories), max_len)])
+                
+                # Build data rows
+                for idx in range(max_len):
+                    row = [str(categories[idx]) if idx < len(categories) else ""]
+                    for series_values in all_series_values:
+                        if series_values and idx < len(series_values):
+                            row.append(str(series_values[idx]))
+                        else:
+                            row.append("")
+                    markdown_chart_table.append("| " + " | ".join(row) + " |")
             
             else:
-                markdown_chart_table.append(f"_Unsupported chart type for programmatic extraction_")
+                markdown_chart_table.append(f"_Unsupported chart type: {chart_type}_")
                 self.logger.debug(f"{file_path_spaces} - Unsupported chart type: {chart_type}")
             
             # Add chart markdown to content
             if markdown_chart_table:
                 md_content += "\n".join(markdown_chart_table) + "\n\n"
             else:
-                md_content += "_Chart data could not be extracted_\n\n"
+                md_content += "_No chart data available_\n\n"
         
         except Exception as e:
             self.logger.error(f"{file_path_spaces} - Error processing chart {chart_count}: {e}")
+            import traceback
+            self.logger.debug(f"Traceback: {traceback.format_exc()}")
             md_content += f"_Error extracting chart data_\n\n"
         
         return md_content
     
-    def _get_reference_values(self, reference, worksheet):
-        """
-        Extract values from a chart data reference.
-        Handles both cached values and direct cell references.
-        """
-        values = []
+    def _get_series_name(self, series):
+        """Extract series name from chart series object."""
         try:
-            if reference is None:
-                return values
+            if hasattr(series, 'title') and series.title:
+                if hasattr(series.title, 'value') and series.title.value:
+                    return str(series.title.value)
+                elif hasattr(series.title, 'v') and series.title.v:
+                    return str(series.title.v)
+            return "Series"
+        except:
+            return "Series"
+    
+    def _extract_chart_categories(self, series, worksheet):
+        """Extract category labels from chart series."""
+        try:
+            if not hasattr(series, 'cat') or not series.cat:
+                return []
             
-            # Try numeric reference with cache
-            if hasattr(reference, 'numRef') and reference.numRef:
-                if hasattr(reference.numRef, 'numCache') and reference.numRef.numCache and hasattr(reference.numRef.numCache, 'pt'):
-                    values = [pt.v for pt in reference.numRef.numCache.pt if pt and hasattr(pt, 'v')]
-                    if values:
-                        return values
-                
-                # Try formula reference if cache is empty
-                if hasattr(reference.numRef, 'f') and reference.numRef.f:
-                    values = self._parse_formula_reference(reference.numRef.f, worksheet)
-                    if values:
-                        return values
+            # Try to get from cache first
+            if hasattr(series.cat, 'strRef') and series.cat.strRef:
+                if hasattr(series.cat.strRef, 'strCache') and series.cat.strRef.strCache:
+                    if hasattr(series.cat.strRef.strCache, 'pt') and series.cat.strRef.strCache.pt:
+                        return [pt.v for pt in series.cat.strRef.strCache.pt if pt and hasattr(pt, 'v')]
             
-            # Try string reference with cache
-            if hasattr(reference, 'strRef') and reference.strRef:
-                if hasattr(reference.strRef, 'strCache') and reference.strRef.strCache and hasattr(reference.strRef.strCache, 'pt'):
-                    values = [pt.v for pt in reference.strRef.strCache.pt if pt and hasattr(pt, 'v')]
-                    if values:
-                        return values
-                
-                # Try formula reference if cache is empty
-                if hasattr(reference.strRef, 'f') and reference.strRef.f:
-                    values = self._parse_formula_reference(reference.strRef.f, worksheet)
-                    if values:
-                        return values
+            if hasattr(series.cat, 'numRef') and series.cat.numRef:
+                if hasattr(series.cat.numRef, 'numCache') and series.cat.numRef.numCache:
+                    if hasattr(series.cat.numRef.numCache, 'pt') and series.cat.numRef.numCache.pt:
+                        return [pt.v for pt in series.cat.numRef.numCache.pt if pt and hasattr(pt, 'v')]
+            
+            # Try to read from formula reference
+            formula = None
+            if hasattr(series.cat, 'strRef') and series.cat.strRef and hasattr(series.cat.strRef, 'f'):
+                formula = series.cat.strRef.f
+            elif hasattr(series.cat, 'numRef') and series.cat.numRef and hasattr(series.cat.numRef, 'f'):
+                formula = series.cat.numRef.f
+            
+            if formula:
+                return self._parse_formula_reference(formula, worksheet)
             
         except Exception as e:
-            self.logger.debug(f"Error getting reference values: {e}")
+            self.logger.debug(f"Error extracting categories: {e}")
         
-        return values
+        return []
+    
+    def _extract_chart_values(self, series, worksheet):
+        """Extract data values from chart series."""
+        try:
+            if not hasattr(series, 'val') or not series.val:
+                return []
+            
+            # Try to get from cache first
+            if hasattr(series.val, 'numRef') and series.val.numRef:
+                if hasattr(series.val.numRef, 'numCache') and series.val.numRef.numCache:
+                    if hasattr(series.val.numRef.numCache, 'pt') and series.val.numRef.numCache.pt:
+                        return [pt.v for pt in series.val.numRef.numCache.pt if pt and hasattr(pt, 'v')]
+            
+            # Try to read from formula reference
+            if hasattr(series.val, 'numRef') and series.val.numRef and hasattr(series.val.numRef, 'f'):
+                formula = series.val.numRef.f
+                if formula:
+                    return self._parse_formula_reference(formula, worksheet)
+            
+        except Exception as e:
+            self.logger.debug(f"Error extracting values: {e}")
+        
+        return []
+    
+    def _extract_chart_x_values(self, series, worksheet):
+        """Extract X values for scatter/bubble charts."""
+        try:
+            if not hasattr(series, 'xVal') or not series.xVal:
+                return []
+            
+            # Try cache
+            if hasattr(series.xVal, 'numRef') and series.xVal.numRef:
+                if hasattr(series.xVal.numRef, 'numCache') and series.xVal.numRef.numCache:
+                    if hasattr(series.xVal.numRef.numCache, 'pt') and series.xVal.numRef.numCache.pt:
+                        return [pt.v for pt in series.xVal.numRef.numCache.pt if pt and hasattr(pt, 'v')]
+            
+            # Try formula
+            if hasattr(series.xVal, 'numRef') and series.xVal.numRef and hasattr(series.xVal.numRef, 'f'):
+                return self._parse_formula_reference(series.xVal.numRef.f, worksheet)
+        
+        except Exception as e:
+            self.logger.debug(f"Error extracting X values: {e}")
+        
+        return []
+    
+    def _extract_chart_y_values(self, series, worksheet):
+        """Extract Y values for scatter/bubble charts."""
+        try:
+            if not hasattr(series, 'yVal') or not series.yVal:
+                return []
+            
+            # Try cache
+            if hasattr(series.yVal, 'numRef') and series.yVal.numRef:
+                if hasattr(series.yVal.numRef, 'numCache') and series.yVal.numRef.numCache:
+                    if hasattr(series.yVal.numRef.numCache, 'pt') and series.yVal.numRef.numCache.pt:
+                        return [pt.v for pt in series.yVal.numRef.numCache.pt if pt and hasattr(pt, 'v')]
+            
+            # Try formula
+            if hasattr(series.yVal, 'numRef') and series.yVal.numRef and hasattr(series.yVal.numRef, 'f'):
+                return self._parse_formula_reference(series.yVal.numRef.f, worksheet)
+        
+        except Exception as e:
+            self.logger.debug(f"Error extracting Y values: {e}")
+        
+        return []
+    
+    def _extract_chart_bubble_sizes(self, series, worksheet):
+        """Extract bubble sizes for bubble charts."""
+        try:
+            if not hasattr(series, 'bubbleSize') or not series.bubbleSize:
+                return []
+            
+            # Try cache
+            if hasattr(series.bubbleSize, 'numRef') and series.bubbleSize.numRef:
+                if hasattr(series.bubbleSize.numRef, 'numCache') and series.bubbleSize.numRef.numCache:
+                    if hasattr(series.bubbleSize.numRef.numCache, 'pt') and series.bubbleSize.numRef.numCache.pt:
+                        return [pt.v for pt in series.bubbleSize.numRef.numCache.pt if pt and hasattr(pt, 'v')]
+            
+            # Try formula
+            if hasattr(series.bubbleSize, 'numRef') and series.bubbleSize.numRef and hasattr(series.bubbleSize.numRef, 'f'):
+                return self._parse_formula_reference(series.bubbleSize.numRef.f, worksheet)
+        
+        except Exception as e:
+            self.logger.debug(f"Error extracting bubble sizes: {e}")
+        
+        return []
     
     def _parse_formula_reference(self, formula, worksheet):
         """
@@ -553,5 +660,3 @@ class ExcelParser(BaseParser):
             except Exception as e:
                 self.logger.error(f"Failed to process {file_path_spaces}: {e}")
                 return []
-
-        

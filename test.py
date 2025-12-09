@@ -263,24 +263,27 @@ def select_chat(thread_id):
 # -------------------------
 
 async def process_agent(user_q, max_retries=MAX_RETRIES):
-    """Process agent with real-time status updates."""
-    now = time.time()
+    ensure_agent_initialized()
+    # Use a single persistent placeholder to avoid container churn
+    ph = st.empty()
+    last_update_time = 0.0
+    last_err = None
     
-    if status == "tool_call":
-        if now - last_update_time > 0.75:
-            ph.markdown(f"🛠️ Using tool: `{update.get('tool_name', '')}`...")
-            last_update_time = now
-    elif status == "system_step":
-        if now - last_update_time > 0.75:
-            ph.markdown(f"🔄 Running step: `{update.get('step_name', '')}`...")
-            last_update_time = now
-    elif status == "done":
-        ph.empty()
-        return update.get("answer")
-    else:
-        if now - last_update_time > 1.5:
-            ph.markdown("💭 Still thinking...")
-            last_update_time = now
+    for attempt in range(1, max_retries + 1):
+        try:
+            answer = await st.session_state.agent.run_agent(user_q)
+            ph.empty()
+            return answer
+        except (APIConnectionError, WorkflowRuntimeError, Exception) as err:
+            last_err = err
+            logger.error(f"Error running agent (attempt {attempt}/{max_retries}): {err}", streamlit_off=True)
+            if attempt < max_retries:
+                ph.markdown("⚠️ Encountered an error, retrying...")
+                sleep_for = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                time.sleep(sleep_for)
+            else:
+                ph.empty()
+                raise last_err
     
     ph.empty()
     return None
@@ -289,11 +292,20 @@ async def process_agent(user_q, max_retries=MAX_RETRIES):
 # Main Chatbot App
 # -------------------------
 
+# Initialize before rendering
+apply_styles()
+initialize_session_state()
+show_uat_banner()
+
+st.title("ALT-Fred: Chatbot for Common Queries")
+st.warning(DISCLAIMER_ALT_FRED)
+st.divider()
+
 # Sidebar - Knowledge Base
 st.sidebar.markdown("# 📚 **Questions?** [ilia.tsimouri@ubs.com](mailto:ilia.tsimouri@ubs.com)")
 
 st.sidebar.divider()
-st.sidebar.header("📂 Manage Knowledge Base", expanded=True)
+st.sidebar.header("📂 Manage Knowledge Base")
 file_metadata = cached_file_metadata(st.session_state.index_manager)
 if not file_metadata:
     st.warning("No files in knowledge base.")
@@ -311,7 +323,7 @@ if st.button("Apply Document Selection", type="primary"):
         st.session_state.agent.update_document_selection(st.session_state.kb_sel)
         logger.success(f"Agent updated with {len(st.session_state.kb_sel)} selected documents.")
 
-# ----------------------------- Chat History ~~~~~~~~~~~~~~~~~~~~~
+# Chat History
 st.sidebar.divider()
 st.sidebar.header("💬 Manage Chats")
 
@@ -329,32 +341,20 @@ for thread in st.session_state.thread_history:
     if st.sidebar.button(button_label, key=widget_key):
         select_chat(thread['thread_id'])
 
-# ----------------------------- Run Agent ~~~~~~~~~~~~~~~~~~~~~
-user_q = st.chat_input("Ask a question about your docs:", key="chat_input")
+# Display chat history (limit to last MAX_MESSAGES_TO_RENDER messages)
+messages_to_render = st.session_state.messages[-MAX_MESSAGES_TO_RENDER:]
+latest_assistant_idx = None
 
-async def process_agent(user_q, max_retries=MAX_RETRIES):
-    ensure_agent_initialized()
-    # Use a single persistent placeholder to avoid container churn
-    ph = st.empty()
-    last_update_time = 0.0
-    last_err = None
-    
-    for attempt in range(1, max_retries + 1):
-        try:
-            answer = asyncio.run(st.session_state.agent.run_agent(user_q))
-            except (APIConnectionError, WorkflowRuntimeError, Exception) as err:
-            last_err = err
-            logger.error(f"Error running agent (attempt {attempt}/{max_retries}): {err}", streamlit_off=True)
-            if attempt < max_retries:
-                ph.markdown("⚠️ Encountered an error, retrying...")
-                sleep_for = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                time.sleep(sleep_for)
-            else:
-                ph.empty()
-                raise last_err
-    
-    ph.empty()
-    return None
+for idx, msg in enumerate(messages_to_render):
+    if msg.role == "assistant":
+        latest_assistant_idx = idx
+
+for i, message in enumerate(messages_to_render):
+    enable_fb = (latest_assistant_idx is not None) and (i == latest_assistant_idx) and (message.role == "assistant")
+    display_message(message, enable_feedback=enable_fb)
+
+# User input
+user_q = st.chat_input("Ask a question about your docs:", key="chat_input")
 
 if user_q:
     logger.info(f"USER - {user_q}", streamlit_off=True)
@@ -377,27 +377,3 @@ if user_q:
     
     # Display assistant message with feedback
     display_message(assistant_message, enable_feedback=True)
-
-# ----------------------------- Display Chat History ~~~~~~~~~~~~~~~~~~~~~
-# Display chat history (limit to last MAX_MESSAGES_TO_RENDER messages)
-messages_to_render = st.session_state.messages[-MAX_MESSAGES_TO_RENDER:]
-latest_assistant_idx = None
-
-for idx, msg in enumerate(messages_to_render):
-    if msg.role == "assistant":
-        latest_assistant_idx = idx
-
-for i, message in enumerate(messages_to_render):
-    enable_fb = (latest_assistant_idx is not None) and (i == latest_assistant_idx) and (message.role == "assistant")
-    display_message(message, enable_feedback=enable_fb)
-
-# ----------------------------- App Title ~~~~~~~~~~~~~~~~~~~~~
-apply_styles()
-initialize_session_state()
-show_uat_banner()
-
-st.title("ALT-Fred: Chatbot for Common Queries")
-st.warning(DISCLAIMER_ALT_FRED)
-st.divider()
-
-

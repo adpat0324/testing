@@ -157,12 +157,46 @@ def display_message(message, enable_feedback=False):
 @st.cache_data(ttl=30, show_spinner=False)
 def get_thread_summaries(user_name, max_threads=50):
     """Return last user message per thread, sorted by most recent thread_id, capped."""
-    mh = get_cached_memory_handler(user_name=user_name)  # handler for all threads
-    df = mh.get_all()[["thread_id", "role", "message", "data"]]
-    df = df[df.role == "user"]
-    df = df.sort_values(["thread_id", "data"], ascending=False).groupby("thread_id").tail(1)
-    df = df.sort_values("thread_id", ascending=False).head(max_threads)
-    return [{"thread_id": int(row.thread_id), "last_message": row.message, "data": row.data} for _, row in df.iterrows()]
+    try:
+        mh = get_cached_memory_handler(user_name=user_name)  # handler for all threads
+        df = mh.get_all()
+        
+        if df.empty:
+            return []
+        
+        # Filter to user messages only
+        if "role" in df.columns:
+            df = df[df.role == "user"]
+        
+        if df.empty:
+            return []
+        
+        # Sort by thread_id and optionally by timestamp if available
+        sort_columns = ["thread_id"]
+        if "data" in df.columns:
+            sort_columns.append("data")
+        elif "timestamp" in df.columns:
+            sort_columns.append("timestamp")
+        elif "created_at" in df.columns:
+            sort_columns.append("created_at")
+        
+        df = df.sort_values(sort_columns, ascending=False).groupby("thread_id").first().reset_index()
+        df = df.sort_values("thread_id", ascending=False).head(max_threads)
+        
+        # Build result list
+        results = []
+        for _, row in df.iterrows():
+            thread_data = {
+                "thread_id": int(row.thread_id),
+                "last_message": row.message if "message" in df.columns else "Chat",
+                "data": row.get("data", row.get("timestamp", row.get("created_at", datetime.datetime.now())))
+            }
+            results.append(thread_data)
+        
+        return results
+    except Exception as e:
+        logger.error(f"Error getting thread summaries: {e}", streamlit_off=True)
+        return []
 
 def load_chats():
     """Load all chat history for the user."""

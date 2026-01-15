@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: embedding-smoke-script
+  namespace: <<NAMESPACE>>
+data:
+  run.py: |
+    import os, json, sys, time
+    import urllib.request
+
+    def must(name: str) -> str:
+      v = os.getenv(name)
+      if not v:
+        print(f"FAIL: missing env var {name}", flush=True)
+        sys.exit(2)
+      return v
+
+    def post_json(url: str, headers: dict, payload: dict, timeout=60):
+      data = json.dumps(payload).encode("utf-8")
+      req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+      with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+    def get_json(url: str, headers: dict, timeout=60):
+      req = urllib.request.Request(url, headers=headers, method="GET")
+      with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+    # ----- Azure OpenAI: get embedding -----
+    aoai_endpoint = must("AZURE_OPENAI_ENDPOINT").rstrip("/")
+    aoai_key = must("AZURE_OPENAI_API_KEY")
+    aoai_deployment = must("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT")
+    aoai_api_version = must("AZURE_OPENAI_API_VERSION")
+
+    text = os.getenv("SMOKE_TEXT", "hello from aks job")
+    aoai_url = f"{aoai_endpoint}/openai/deployments/{aoai_deployment}/embeddings?api-version={aoai_api_version}"
+    aoai_headers = {
+      "Content-Type": "application/json",
+      "api-key": aoai_key,
+    }
+    st, emb = post_json(aoai_url, aoai_headers, {"input": text})
+    vec = emb["data"][0]["embedding"]
+    dims = len(vec)
+
+    # ----- Azure AI Search: upsert document with vector -----
+    search_endpoint = must("AZURE_SEARCH_ENDPOINT").rstrip("/")
+    search_index = must("AZURE_SEARCH_INDEX")
+    search_api_version = os.getenv("AZURE_SEARCH_API_VERSION", "2024-07-01")
+    search_key = must("AZURE_SEARCH_API_KEY")
+
+    vector_field = must("AZURE_SEARCH_VECTOR_FIELD")
+    key_field = os.getenv("AZURE_SEARCH_KEY_FIELD", "id")
+    doc_id = os.getenv("SMOKE_DOC_ID", f"smoke-{int(time.time())}")
+
+    # Minimal doc: key + vector + a text field
+    doc = {
+      "@search.action": "mergeOrUpload",
+      key_field: doc_id,
+      "smokeText": text,
+      vector_field: vec
+    }
+
+    index_url = f"{search_endpoint}/indexes/{search_index}/docs/index?api-version={search_api_version}"
+    search_headers = {
+      "Content-Type": "application/json",
+      "api-key": search_key,
+    }
+    st2, out = post_json(index_url, search_headers, {"value": [doc]})
+    if "errorMessage" in json.dumps(out):
+      print("FAIL: index response contains error:", out, flush=True)
+      sys.exit(3)
+
+    # ----- Read back (GET by key) -----
+    # URL encoding for key is out of scope; assume simple id.
+    get_url = f"{search_endpoint}/indexes/{search_index}/docs('{doc_id}')?api-version={search_api_version}"
+    st3, got = get_json(get_url, search_headers)
+
+    # Don't print secrets or full vectors. Just verify presence.
+    has_vector = vector_field in got
+    print("PASS" if has_vector else "PASS (vector not retrievable; doc exists)", flush=True)
+    print(json.dumps({
+      "doc_id": doc_id,
+      "embedding_dimensions": dims,
+      "vector_field_present_in_get": has_vector,
+      "note": "If vector_field_present_in_get=false, your vector field is likely non-retrievable (common) but it can still be used for vector search."
+    }, indent=2), flush=True)
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: embedding-smoke
+  namespace: <<NAMESPACE>>
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: <<SERVICE_ACCOUNT_NAME>>
+      containers:
+      - name: smoke
+        image: python:3.11-slim
+        command: ["python", "/app/run.py"]
+        env:
+        # Non-secret env (copy these values from your deployment, or hardcode if you prefer)
+        - name: AZURE_OPENAI_ENDPOINT
+          value: "<<AZURE_OPENAI_ENDPOINT>>"
+        - name: AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT
+          value: "<<AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT>>"
+        - name: AZURE_OPENAI_API_VERSION
+          value: "<<AZURE_OPENAI_API_VERSION>>"
+        - name: AZURE_SEARCH_ENDPOINT
+          value: "<<AZURE_SEARCH_ENDPOINT>>"
+        - name: AZURE_SEARCH_INDEX
+          value: "<<AZURE_SEARCH_INDEX>>"
+        - name: AZURE_SEARCH_VECTOR_FIELD
+          value: "<<VECTOR_FIELD_NAME>>"
+        - name: AZURE_SEARCH_KEY_FIELD
+          value: "id"
+        # Secrets via secretKeyRef (names/keys only; no reading values)
+        - name: AZURE_OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: "<<OPENAI_SECRET_NAME>>"
+              key: "<<OPENAI_SECRET_KEY>>"
+        - name: AZURE_SEARCH_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: "<<SEARCH_SECRET_NAME>>"
+              key: "<<SEARCH_SECRET_KEY>>"
+        volumeMounts:
+        - name: script
+          mountPath: /app
+      volumes:
+      - name: script
+        configMap:
+          name: embedding-smoke-script
+          defaultMode: 0555

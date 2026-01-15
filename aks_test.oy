@@ -1,0 +1,18 @@
+kubectl -n $ns get deploy $deploy -o jsonpath="{range .spec.template.spec.containers[0].env[*]}{.name}{'\n'}{end}"
+
+
+kubectl -n $ns get deploy $deploy -o jsonpath="{range .spec.template.spec.containers[0].env[?(@.name=='AZURE_OPENAI_API_KEY')]}{.valueFrom.secretKeyRef.name}{' '}{.valueFrom.secretKeyRef.key}{end}"
+
+
+
+kubectl -n $ns get deploy $deploy -o jsonpath="{range .spec.template.spec.containers[0].env[?(@.name=='AZURE_SEARCH_API_KEY')]}{.valueFrom.secretKeyRef.name}{' '}{.valueFrom.secretKeyRef.key}{end}"
+
+
+kubectl -n $ns get deploy $deploy -o jsonpath="{range .spec.template.spec.containers[0].env[?(@.name=='AZURE_OPENAI_ENDPOINT')]}{.value}{end}"
+kubectl -n $ns get deploy $deploy -o jsonpath="{range .spec.template.spec.containers[0].env[?(@.name=='AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT')]}{.value}{end}"
+kubectl -n $ns get deploy $deploy -o jsonpath="{range .spec.template.spec.containers[0].env[?(@.name=='AZURE_OPENAI_API_VERSION')]}{.value}{end}"
+kubectl -n $ns get deploy $deploy -o jsonpath="{range .spec.template.spec.containers[0].env[?(@.name=='AZURE_SEARCH_ENDPOINT')]}{.value}{end}"
+kubectl -n $ns get deploy $deploy -o jsonpath="{range .spec.template.spec.containers[0].env[?(@.name=='AZURE_SEARCH_INDEX')]}{.value}{end}"
+
+
+
